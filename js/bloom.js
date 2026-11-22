@@ -1,36 +1,36 @@
 /* ============================================================
- * 粒子花朵引擎 (Canvas 2D) · Nocturne
+ * 粒子花朵引擎 (WebGL 点精灵) · Nocturne / Rosé
  * ------------------------------------------------------------
- * 一朵花 = 三层「花轮」(whorl)，每层若干片参数化花瓣：
- *   · 伪 3D：花瓣以 tilt 角斜立，open 时摊平、closed 时竖起包成花苞；
- *     花平面按 flatten 压成椭圆，形成斜俯视的立体感。
- *   · 每片花瓣 = 平滑贝塞尔轮廓 + 根到尖渐变瓣面 + 三层瓣缘描边
- *     + 主脉 / 侧脉 / 瓣尖高光 + 稀疏填充微粒。
- *   · 花心 = 黄金角颗粒 + 辐射雄蕊细丝 + 柔光晕。
- *   · 分层开放：外层 lag=0 先舒展，内层 lag>0 后跟，张手时依次绽开。
- *   · 弹簧-阻尼跟随目标位形；降质时按 rank 砍填充点，永远保住轮廓。
- * 黑底用 lighter 叠加，樱花粉 / 蜜桃粉 / 粉白，发光但不糊。
- * 轮廓质感由矢量层保证（不随性能降质），粒子层只负责闪烁细节。
+ * 一朵花 = 三层花轮 + 花心 + 放射迸发流 + 环境浮尘 + 星芒，
+ * 合计约 4.7 万个发光粒子，全部在 GPU 上以叠加混合绘制。
+ *
+ * 设计要点：
+ *  · 位形烘焙：CPU 端用参数化花瓣几何算出每个粒子「全开」与「全闭」
+ *    两个局部坐标，连同颜色 / 尺寸 / 亮度 / 相位 / 分层延迟一起塞进
+ *    静态 VBO。每帧只更新 uniform，位置在顶点着色器里插值 ——
+ *    4.7 万点 ≈ 一次 drawArrays，比 Canvas 2D 逐点画几千点还快。
+ *  · 分层开放：每层花轮有 lag，张手时外层先舒展、内层后跟。
+ *  · 重要性排序：粒子按 rank 降序烘焙，降质时直接少画尾部，
+ *    先丢浮尘、再丢瓣面填充，花心与瓣缘永远保留。
+ *  · 叠加混合 (SRC_ALPHA, ONE)：花心层层累积自然过曝成亮核，
+ *    这就是参考图那种「中心爆亮、四周星云」的成因。
+ *  · 安全网：WebGL 不可用或着色器编译失败时，自动回退 Canvas 2D
+ *    精致版 (bloom2d.js)，绝不黑屏。
  * ============================================================ */
 (function (global) {
   'use strict';
 
   var Y = global.YSHNB;
-  var F = Y.CFG.flower;
-  var P = Y.CFG.physics;
-  var R = Y.CFG.render;
-  var C = Y.CFG.palette;
-  var L = Y.CFG.light;
+  var CFG = Y.CFG;
+  var F = CFG.flower;
+  var P = CFG.physics;
+  var R = CFG.render;
+  var C = CFG.palette;
+  var PC = CFG.particles;
   var WH = F.whorls;
   var TAU = Math.PI * 2;
-  var SHADES = 5;                 // 每层花瓣从根到尖的色阶数
-  var PER = SHADES + 1;           // 每层 sprite 数（色阶 + 1 个高光）
-  var CORE_I = WH.length * PER;   // 花心 sprite 下标
-  var SPARK_I = CORE_I + 1;       // 火花
-  var GLINT_I = CORE_I + 2;       // 纯白高光
-  var HALO_I = CORE_I + 3;        // 粉白柔光（瓣心 / 花心大晕）
-  var MOTE_I = CORE_I + 4;        // 粉白光粒（环境浮游）
 
+  /* ---------- 小工具 ---------- */
   function lerp(a, b, t) { return a + (b - a) * t; }
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
 
@@ -40,14 +40,17 @@
              g: parseInt(h.substring(2, 4), 16),
              b: parseInt(h.substring(4, 6), 16) };
   }
+  function hex01(hex) {
+    var c = hexRgb(hex);
+    return [c.r / 255, c.g / 255, c.b / 255];
+  }
+  function mixRgb(a, b, t) {
+    t = clamp(t, 0, 1);
+    return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+  }
   function rgba(hex, a) {
     var c = hexRgb(hex);
     return 'rgba(' + c.r + ',' + c.g + ',' + c.b + ',' + a + ')';
-  }
-  function mixHex(a, b, t) {
-    var x = hexRgb(a), y = hexRgb(b);
-    function h(n) { var s = Math.round(n).toString(16); return s.length < 2 ? '0' + s : s; }
-    return '#' + h(lerp(x.r, y.r, t)) + h(lerp(x.g, y.g, t)) + h(lerp(x.b, y.b, t));
   }
   function mulberry(a) {
     return function () {
@@ -58,40 +61,10 @@
     };
   }
 
-  /* ---------- 离屏柔光点 ---------- */
-  function makeSprite(hex, size) {
-    var s = size || R.spriteSize;
-    var cv = document.createElement('canvas');
-    cv.width = s; cv.height = s;
-    var g = cv.getContext('2d');
-    var grd = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
-    grd.addColorStop(0, rgba(hex, 1));
-    grd.addColorStop(0.14, rgba(hex, 0.94));
-    grd.addColorStop(0.38, rgba(hex, 0.42));
-    grd.addColorStop(0.72, rgba(hex, 0.09));
-    grd.addColorStop(1, rgba(hex, 0));
-    g.fillStyle = grd;
-    g.fillRect(0, 0, s, s);
-    return cv;
-  }
-  function buildPalette() {
-    var arr = [], w, s;
-    for (w = 0; w < WH.length; w++) {
-      for (s = 0; s < SHADES; s++) {
-        arr.push(makeSprite(mixHex(WH[w].root, WH[w].tip, s / (SHADES - 1))));
-      }
-      arr.push(makeSprite(WH[w].glow));        // base + SHADES：零星高光点
-    }
-    arr.push(makeSprite(C.core));
-    arr.push(makeSprite(C.spark));
-    arr.push(makeSprite('#FFFFFF'));
-    arr.push(makeSprite('#FFE6F2'));   // HALO_I：粉白柔光
-    arr.push(makeSprite('#FFEFF7'));   // MOTE_I：粉白光粒
-    return arr;
-  }
-
-  /* ---------- 花瓣参数化位形（相对花心） ---------- */
-  function petalPoint(wh, count, p, u, v, o, sway, out) {
+  /* ---------- 花瓣参数化位形（含伪 3D 高度 z） ----------
+   * 与 2D 回退层完全同一套几何：纺锤轮廓 + 主浪/细浪 + 斜立→摊平。
+   * o=1 得「全开」位形，o=0 得「花苞」位形，烘焙时各取一次。 */
+  function petalPoint(wh, count, p, u, v, o, out) {
     var lag = wh.lag || 0;
     var oe = clamp((o - lag) / (1 - lag), 0, 1);
 
@@ -101,8 +74,6 @@
     var curl = lerp(wh.curlClosed, wh.curlOpen, oe);
     var tilt = lerp(wh.tiltClosed, wh.tiltOpen, oe);
 
-    /* 纺锤形轮廓：瓣根收、中段宽、瓣尖收；
-     * 主浪 + 高频细浪叠加，做出真花瓣那种不完全规整的柔顺瓣缘。 */
     var prof = Math.pow(Math.sin(Math.PI * clamp(u, 0, 1)), wh.profilePow);
     var wave = F.ripple * Math.sin(u * Math.PI * 3 + p * 1.7)
              + (F.ripple2 || 0) * Math.sin(u * Math.PI * 9 + p * 2.9 + (wh.rot || 0) * 11);
@@ -110,269 +81,795 @@
     var tang = v * halfW;
 
     var ang = ((p + (wh.phase || 0)) / count) * TAU + (wh.rot || 0)
-              + (wh.twistDir || 1) * F.twist * o + sway;
-    var ux = Math.sin(ang), uy = -Math.cos(ang);   // 径向外
-    var tx = Math.cos(ang), ty = Math.sin(ang);    // 切向
+              + (wh.twistDir || 1) * F.twist * o;
+    var ux = Math.sin(ang), uy = -Math.cos(ang);
+    var tx = Math.cos(ang), ty = Math.sin(ang);
 
-    /* 斜立 → 摊平：tilt 大时花瓣向上长（花苞），小时向外铺（盛放） */
     var proj = len * Math.cos(tilt);
     var rise = len * Math.sin(tilt);
     var u2 = u * u;
     var radial = rad + u * proj - curl * u2 * len * 0.18;
-    var z = u * rise + curl * u2 * len * 0.55;     // 瓣尖上卷 / 内扣
+    var z = u * rise + curl * u2 * len * 0.55;
 
-    var px = radial * ux + tang * tx;
-    var py = radial * uy + tang * ty;
-    out.x = px;
-    out.y = py * F.flatten - z * F.zScale;
-    out.oe = oe;
+    out.x = radial * ux + tang * tx;
+    out.y = (radial * uy + tang * ty) * F.flatten - z * F.zScale;
+    out.z = z;
     return out;
   }
 
-  /* ---------- 单个粒子 ---------- */
-  function mkPt(w, p, u, v, kind, tmp, rnd) {
-    var base = w * PER;
-    var ci = base + Math.min(SHADES - 1, Math.floor(u * SHADES));
-    if (kind === 'edge' && rnd() > 0.80) ci = base + SHADES;   // 瓣缘零星纯色高光
-    var size, rank, al;
-    if (kind === 'edge') {
-      size = 1.35 + rnd() * 1.05; rank = 0.10 + rnd() * 0.14; al = R.edgeAlpha;
-    } else if (kind === 'vein') {
-      size = 1.20 + rnd() * 0.95; rank = 0.27 + rnd() * 0.20; al = R.veinAlpha;
-    } else {
-      size = 1.90 + rnd() * 1.90; rank = 0.55 + rnd() * 0.45; al = R.fillAlpha;
+  /* ---------- 单层花瓣边界：给定「某一层 + 参数角 a」，返回该方向丝长 ----------
+   * 轮廓用 |cos(N·Δ/2)| 的幂函数拟合：瓣中为 1、瓣间为 0。
+   * 指数取 2.2：指数小的话瓣间只塌一半，瓣与瓣之间糊成一片；放大后
+   * 瓣间塌得彻底，9 片瓣才有清晰的缝。
+   *
+   * 注意这是【单层】——早先按三层取 max 是错的：三层 rot 互相错开
+   * （0 / 0.36 / 0.72），一层的瓣间正好被另一层的瓣中填满，轮廓被抹成
+   * 圆形，花瓣感全丢。放射丝必须按层各自生成，长度只用本层轮廓。
+   * 注：a 是「参数空间」角，屏幕上是椭圆（乘了 flatten），与花瓣一致。 */
+  function layerEdge(wh, a) {
+    var rel = a - (wh.rot || 0);
+    var lobe = Math.pow(Math.abs(Math.cos(rel * wh.count * 0.5)), 2.2);
+    return wh.radiusOpen * (0.26 + 0.74 * lobe) + wh.lenOpen * lobe;
+  }
+
+  /* ============================================================
+   * 位形烘焙：生成全部粒子的静态属性
+   * 数据布局（每粒子 12 个 float）：
+   *   0,1  open  xy      2,3  close xy
+   *   4,5,6 color rgb    7    size
+   *   8    bright        9    phase
+   *   10   lag           11   kind
+   * ============================================================ */
+  var STRIDE_F = 12;
+
+  function bake() {
+    var rnd = mulberry(20261122);
+    var tmp = { x: 0, y: 0, z: 0 };
+    var pts = [];
+    var R0 = WH[0].radiusOpen + WH[0].lenOpen;    // 外轮最远半径（局部单位）
+
+    var CORE_HOT = hex01(PC.coreHot), CORE_WARM = hex01(PC.coreWarm),
+        CORE_ROSE = hex01(PC.coreRose);
+    var P_ROOT = hex01(PC.petalRoot), P_MID = hex01(PC.petalMid),
+        P_TIP = hex01(PC.petalTip), P_GLOW = hex01(PC.petalGlow);
+    var R_NEAR = hex01(PC.radialNear), R_MID = hex01(PC.radialMid),
+        R_FAR = hex01(PC.radialFar);
+    var D_PINK = hex01(PC.dustPink), D_ICE = hex01(PC.dustIce);
+    var GLINT = hex01(PC.glint);
+
+    var i, w, p, wh, u, v;
+
+    /* ---------- 1) 花瓣本体：径向「光瓣」 ----------
+     * 参考图不是靠描边勾瓣形，而是从中心向外喷的光流：中间最密、
+     * 向两侧与瓣尖自然消隐。所以不再用「贴边点列」勾轮廓 ——
+     * 那正是锯齿硬边的来源 —— 改为横向高斯分布 + 沿瓣长衰减，
+     * 没有硬边、天然没有台阶，近看也只是一层层渐变的光。 */
+    var totalLen = 0;
+    for (w = 0; w < WH.length; w++) {
+      totalLen += WH[w].lenOpen * WH[w].count;
     }
-    return {
-      kind: kind, w: w, p: p, u: u, v: v, ci: ci,
-      cx: tmp.x, cy: tmp.y,
-      x: tmp.x, y: tmp.y, vx: 0, vy: 0,
-      size: size, al: al, rank: rank, phase: rnd() * TAU
-    };
-  }
-
-  /* ---------- 一朵花 ---------- */
-  function Flower(seed) {
-    this.seed = seed || 0;
-    this.particles = [];
-    this.stamens = [];
-    this.x = 0; this.y = 0;
-    this.openness = 0; this.scale = 1; this.alpha = 1;
-    this.build();
-  }
-
-  Flower.prototype.build = function () {
-    var pts = this.particles;
-    var rnd = mulberry(Math.floor(this.seed * 9973) + 7);
-    var tmp = { x: 0, y: 0, oe: 0 };
-    var w, p, i, b, k, q, side, u, v;
 
     for (w = 0; w < WH.length; w++) {
-      var wh = WH[w], count = wh.count;
-      for (p = 0; p < count; p++) {
-        /* 瓣缘：两侧各 edgeBands 束，密集小亮点连成清晰轮廓 */
-        for (side = -1; side <= 1; side += 2) {
-          for (b = 0; b < F.edgeBands; b++) {
-            for (i = 0; i < F.rings; i++) {
-              u = (i + 0.5) / F.rings;
-              v = side * (0.97 - b * 0.055);
-              petalPoint(wh, count, p, u, v, 0, 0, tmp);
-              pts.push(mkPt(w, p, u, v, 'edge', tmp, rnd));
-            }
-          }
-        }
-        /* 侧脉：从瓣根到瓣尖的细线 */
-        for (k = 0; k < F.veinCount; k++) {
-          v = F.veinCount === 1 ? 0 : ((k / (F.veinCount - 1)) * 2 - 1) * 0.62;
-          for (i = 0; i < F.rings; i++) {
-            u = (i + 0.5) / F.rings;
-            petalPoint(wh, count, p, u, v, 0, 0, tmp);
-            pts.push(mkPt(w, p, u, v, 'vein', tmp, rnd));
-          }
-        }
-        /* 填充：稀疏、随机、低亮，像花粉与纱的质感 */
-        for (i = 0; i < F.rings; i++) {
-          for (q = 0; q < F.fillPerRow; q++) {
-            u = (i + rnd()) / F.rings;
-            v = (rnd() * 2 - 1) * 0.88;
-            petalPoint(wh, count, p, u, v, 0, 0, tmp);
-            pts.push(mkPt(w, p, u, v, 'fill', tmp, rnd));
-          }
+      wh = WH[w];
+      var tag = wh.lag || 0;
+      /* 按「瓣长 × 瓣数」加权分配预算：外层瓣更长更大，分到更多点。
+       * 注意这里是「每片花瓣」的点数，总预算 = petalFill。 */
+      var nPer = Math.max(300, Math.round(PC.petalFill * wh.lenOpen / totalLen));
+      for (p = 0; p < wh.count; p++) {
+        for (i = 0; i < nPer; i++) {
+          /* u 偏根密：光流近花心处最密，越往外越稀 */
+          u = Math.pow(rnd(), 0.68);
+          /* 横向高斯（4 个均匀分布之和 ≈ 正态）：瓣中密、边缘稀到消失 */
+          v = clamp((rnd() + rnd() + rnd() + rnd() - 2.0) * 0.62, -0.98, 0.98);
+
+          petalPoint(wh, wh.count, p, u, v, 1, tmp);
+          var pox = tmp.x, poy = tmp.y, poz = tmp.z;
+          petalPoint(wh, wh.count, p, u, v, 0, tmp);
+
+          /* 瓣根玫红 → 瓣中亮粉 → 瓣尖暖粉白；靠内叠一点暖金，
+           * 与过曝的花心自然衔接，避免"白核 / 粉瓣"的断层。 */
+          var pc2 = mixRgb(P_ROOT, P_MID, Math.min(1, u * 1.6));
+          pc2 = mixRgb(pc2, P_TIP, Math.max(0, (u - 0.45) / 0.55));
+          if (u < 0.24) pc2 = mixRgb(pc2, CORE_WARM, (0.24 - u) / 0.24 * 0.50);
+
+          /* 这一层只做「薄纱」：花瓣的体积感靠它，形完全交给放射丝。
+           * 所以亮度压低、沿瓣长更快渐隐，避免糊成一团雾。 */
+          var fade = 1.0 - 0.34 * u;
+          var pt2 = 0.92 + rnd() * 0.20;
+          pts.push({
+            ox: pox, oy: poy,
+            cx: tmp.x, cy: tmp.y,
+            col: [pc2[0] * pt2, pc2[1] * pt2, pc2[2] * pt2],
+            size: lerp(PC.sizePetal[1], PC.sizePetal[0], Math.pow(u, 0.70)) * (0.82 + rnd() * 0.50),
+            bright: PC.brightPetal * fade * (0.78 + rnd() * 0.44),
+            phase: rnd() * TAU,
+            lag: tag,
+            kind: 0,
+            rank: 0.86 + rnd() * 0.06 - 0.10 * u,
+            z: poz
+          });
         }
       }
     }
 
-    /* 花心：黄金角分布，闭合时紧、盛放时铺开 */
-    var cr = WH[2].radiusClosed * 0.92;
-    var orr = WH[0].radiusOpen * 0.52;
-    for (i = 0; i < F.coreCount; i++) {
-      var t = (i + 0.5) / F.coreCount;
+    /* ---------- 2) 花心：过曝的暖白亮核 ---------- */
+    for (i = 0; i < PC.coreCount; i++) {
+      var t = (i + 0.5) / PC.coreCount;
       var rr = Math.sqrt(t);
-      var a = i * 2.399963229728653;
-      var cx = Math.cos(a) * rr * cr, cy = Math.sin(a) * rr * cr * F.flatten;
+      /* 黄金角 + 较强抖动：纯黄金角螺旋在密集小点上会显出规则的「网格/
+       * 编织纹」，加抖动把点阵打散，中心才是一团连续的白热光而不是点阵。 */
+      var a = i * 2.399963229728653 + rr * 1.6 + (rnd() - 0.5) * 0.85;
+      var cr = 17 * rr + (rnd() - 0.5) * 4.0;
+      var orr = 28 * rr + (rnd() - 0.5) * 4.6;
+      if (cr < 0) cr = 0;
+      if (orr < 0) orr = 0;
+      var ccx = Math.cos(a) * cr, ccy = Math.sin(a) * cr * F.flatten;
+      var cox = Math.cos(a) * orr, coy = Math.sin(a) * orr * F.flatten;
+      var ccol = rr < 0.55
+        ? mixRgb(CORE_HOT, CORE_WARM, rr / 0.55)
+        : mixRgb(CORE_WARM, CORE_ROSE, (rr - 0.55) / 0.45);
       pts.push({
-        kind: 'core', w: 2, p: 0, u: 0, v: 0, ci: CORE_I,
-        cx: cx, cy: cy, ox: Math.cos(a) * rr * orr, oy: Math.sin(a) * rr * orr * F.flatten,
-        x: cx, y: cy, vx: 0, vy: 0,
-        size: 1.7 + rnd() * 2.1, al: R.coreAlpha,
-        rank: 0.08 + rnd() * 0.22, phase: rnd() * TAU
+        ox: cox, oy: coy, cx: ccx, cy: ccy,
+        col: ccol,
+        size: lerp(PC.sizeCore[1], PC.sizeCore[0], rr) * (0.70 + rnd() * 0.70),
+        bright: PC.brightCore * (1.15 - 0.50 * rr) * (0.80 + rnd() * 0.45),
+        phase: rnd() * TAU,
+        lag: 0,
+        kind: 1,
+        rank: 1.0,
+        z: (rnd() - 0.5) * 36
       });
     }
 
-    /* 雄蕊细丝 */
-    for (i = 0; i < F.stamenCount; i++) {
-      this.stamens.push({
-        a: (i / F.stamenCount) * TAU + rnd() * 0.14,
-        ph: rnd() * TAU,
-        len: 0.58 + rnd() * 0.42
+    /* ---------- 2.5) 近核暖金光环 ----------
+     * 纯白核直接接粉瓣会有一道断层，参考图里白心外面是一圈明显的
+     * 橙金热区。单独铺一圈稀疏的暖金点：密度不高，不会被白核的叠加
+     * 吃掉，颜色才留得住。 */
+    for (i = 0; i < PC.goldRingCount; i++) {
+      var ga2 = rnd() * TAU;
+      var rr2 = PC.goldRingIn + Math.pow(rnd(), 0.72) * (PC.goldRingOut - PC.goldRingIn);
+      var gx2 = Math.cos(ga2) * rr2;
+      var gy2 = Math.sin(ga2) * rr2 * F.flatten;
+      var gc = mixRgb(R_NEAR, R_MID, Math.min(1, (rr2 - PC.goldRingIn) / (PC.goldRingOut - PC.goldRingIn)));
+      pts.push({
+        ox: gx2, oy: gy2, cx: gx2 * 0.22, cy: gy2 * 0.22,
+        col: gc,
+        size: 3.2 + rnd() * 4.6,
+        bright: PC.brightRadial * (0.52 + rnd() * 0.38),
+        phase: rnd() * TAU,
+        lag: rnd() * 0.08,
+        kind: 2,
+        rank: 0.84 + rnd() * 0.05,
+        z: (rnd() - 0.5) * 40
       });
     }
-    /* 环境光粒：绕花缓慢浮游的细碎亮点，各自有轨道、相位与色温 */
-    this.motes = [];
-    var outer = WH[0].radiusOpen * L.moteRadius;
-    for (i = 0; i < L.motesPerFlower; i++) {
-      var ma = rnd() * TAU;
-      var mr = Math.sqrt(rnd()) * outer;
-      var pick = rnd();
-      this.motes.push({
-        a: ma, r: mr, drift: (rnd() - 0.5) * 2,
-        ph: rnd() * TAU, bob: 0.6 + rnd() * 0.9,
-        size: L.moteSizeMin + rnd() * (L.moteSizeMax - L.moteSizeMin),
-        ci: pick < 0.42 ? MOTE_I : (pick < 0.70 ? GLINT_I : (pick < 0.87 ? CORE_I : SHADES))
+
+    /* ---------- 3) 放射细丝：花的主体 ----------
+     * 参考图的「爆炸感」= 数百条极细的放射丝从花心笔直喷出，每条丝
+     * 长度不同（由所属花瓣层的轮廓决定），越长越稀越暗，丝间留黑。
+     *
+     * 三个关键：
+     *  · 外层循环 = 一条丝，丝内沿半径【等距分层】放点。纯随机会形成
+     *    泊松式的「斑块 + 空隙」，看起来是断续碎点；分层才连成光流。
+     *  · 丝按三层分配，每条丝只用【本层】轮廓算长度 —— 三层 rot 错开，
+     *    合起来才是「9 大瓣 + 8 中瓣 + 6 内瓣」的层次，不会互相填平。
+     *  · 长度各带溢出系数，参差的丝尖就是毛边，不需要任何描边。 */
+    var beamCount = Math.max(24, Math.round(PC.radialBeams || 620));
+    var perBeam = Math.max(2, Math.round(PC.radialCount / beamCount));
+
+    /* 丝数按 lenOpen^1.6 加权分配（而不是线性）：外层瓣最长，单位角度
+     * 覆盖的弧长最大，必须分到远多于线性的丝数，否则瓣尖处丝间距能到
+     * 7px（点径才 4.8px），一眼就是点阵。指数 1.6 之后外层约拿 51%，
+     * 瓣尖的丝间距压到 3px 以内，才连成光带。 */
+    var sumLenW = 0;
+    for (w = 0; w < WH.length; w++) sumLenW += Math.pow(WH[w].lenOpen, 1.6);
+    var beamBudget = [];
+    var remainBeams = beamCount;
+    for (w = 0; w < WH.length; w++) {
+      var nb = (w === WH.length - 1) ? remainBeams
+             : Math.max(6, Math.round(beamCount * Math.pow(WH[w].lenOpen, 1.6) / sumLenW));
+      beamBudget.push(nb);
+      remainBeams -= nb;
+    }
+
+    /* 层缩比：外层全伸展，中/内层大幅收进来。
+     * 否则中层丝（226）会伸到外层瓣间（17）的区域，把 9 片瓣的缝填平，
+     * 三层的长度差被压到只剩 25%，视觉上就还是一团圆形星云。
+     * 收短之后：中心 0~55 被内层填实，55~130 是中层，130~302 只剩外层
+     * 9 片长瓣 —— 瓣形立刻出来，也正是真实花里「内瓣被外瓣遮住」的样子。 */
+    var layerShort = [1.0, 0.58, 0.38];
+    for (w = 0; w < WH.length; w++) {
+      var whS = WH[w];
+      var nbS = beamBudget[w];
+      if (nbS <= 0) continue;
+      var layerLag = whS.lag || 0;
+      var shorten = layerShort[w] || 1.0;
+      var halfW = Math.PI / whS.count;   // 单瓣的半角宽
+      for (var bi = 0; bi < nbS; bi++) {
+        /* 丝的角度：按瓣轮转分配，再在瓣内【等分铺开】。
+         *  · 均匀铺满 360° 是错的：瓣间也有丝，9 片瓣的缝被磨平，只剩
+         *    一圈放射星云。
+         *  · 纯随机（三角分布）也不行：每瓣分到的丝数不定，瓣形不对称，
+         *    有的瓣爆长有的瓣空缺，看着像朵畸形的花。
+         * 等分之后每瓣形状一致，长度仍由 lobe 决定（瓣中长、瓣缘短），
+         * 瓣尖自然收窄 —— 规整的花形不需要任何描边。 */
+        var pIdx = bi % whS.count;
+        var jIdx = Math.floor(bi / whS.count);
+        var nPerPetal = Math.max(1, Math.round(nbS / whS.count));
+        var pAxis = (pIdx + (whS.phase || 0)) / whS.count * TAU + (whS.rot || 0);
+        var frac = (jIdx + 0.5) / nPerPetal - 0.5;
+        var a0 = pAxis + frac * 2 * halfW * 0.94 + (rnd() - 0.5) * 0.018;
+        var maxR = layerEdge(whS, a0) * shorten;
+        /* 飞散只发生在瓣缘【外侧】：从 0.66 倍瓣长处起，向外喷到 1.0~1.9 倍。
+         * 早先让丝从圆心一路喷到瓣尖是错的 —— 那会把「瓣面」画成骨架，
+         * 花瓣中间全是黑缝。现在瓣面由真实花瓣几何高密度填充（实心光瓣），
+         * 丝只负责瓣缘爆散出的毛边与火星，两层叠加才是参考图的样子。 */
+        var over = 1.04 + rnd() * 0.34;
+        if (rnd() < 0.22) over = 1.34 + rnd() * 0.55;   // 少量长丝，炸得更远
+        var reachR = maxR * over;
+        var startR = maxR * 0.62;
+        var lagB = layerLag + rnd() * 0.12;
+        for (var k = 0; k < perBeam; k++) {
+          var rn = (k + rnd()) / perBeam;
+          var ru = rn;
+          var rad = startR + ru * (reachR - startR);
+          /* 丝自身极细；抖动随半径加速增长，远端自然散成絮状 */
+          var a2 = a0 + (rnd() - 0.5) * (0.0030 + 0.013 * ru * ru);
+          var sw = PC.radialSwirl * (rad / R0) * 0.045;
+          var ang = a2 + sw;
+          var rox = Math.cos(ang) * rad, roy = Math.sin(ang) * rad * F.flatten;
+          /* 闭合位形：收成有层次的光蕾，不挤成一坨白点 */
+          var cr2 = 0.05 + 0.10 * ru;
+          var rcx = Math.cos(ang) * rad * cr2, rcy = Math.sin(ang) * rad * cr2 * F.flatten;
+          /* 飞散丝：起点接瓣缘（粉白）→ 中段玫红 → 远端暗红渐隐，
+           * 这样瓣缘是一圈亮边，往外像被吹散的余烬。 */
+          var rc = mixRgb(P_MID, R_MID, Math.min(1, ru * 1.5));
+          rc = mixRgb(rc, R_FAR, Math.max(0, (ru - 0.45) / 0.55));
+          /* 起点略提亮，瓣缘才有「亮起来」的收尾 */
+          var tipBoost = ru < 0.18 ? 1.0 + (0.18 - ru) * 2.2 : 1.0;
+          pts.push({
+            ox: rox, oy: roy, cx: rcx, cy: rcy,
+            col: rc,
+            size: lerp(PC.sizeRadial[1], PC.sizeRadial[0], Math.pow(ru, 0.34)) * (0.72 + rnd() * 0.62),
+            bright: PC.brightRadial * (1.0 - 0.44 * ru) * (0.72 + rnd() * 0.62) * tipBoost,
+            phase: rnd() * TAU,
+            lag: lagB,
+            kind: 2,
+            rank: 0.72 - 0.36 * ru,
+            z: (rnd() - 0.5) * 78
+          });
+        }
+      }
+    }
+
+    /* ---------- 4) 环境浮尘：大范围缓慢浮游，制造空间深度 ---------- */
+    for (i = 0; i < PC.dustCount; i++) {
+      var da = rnd() * TAU;
+      /* 从中心附近一直铺到画面边缘：参考图不只是「环状尘埃」，
+       * 整个放射区都散落着细碎光点，这才是星云感。 */
+      var dr = R0 * (0.10 + Math.sqrt(rnd()) * 3.1);
+      var dx = Math.cos(da) * dr;
+      var dy = Math.sin(da) * dr * (0.86 + rnd() * 0.20);
+      var dcol = rnd() < 0.82 ? D_PINK : D_ICE;
+      var dt2 = 0.80 + rnd() * 0.30;
+      pts.push({
+        ox: dx, oy: dy, cx: dx, cy: dy,
+        col: [dcol[0] * dt2, dcol[1] * dt2, dcol[2] * dt2],
+        size: lerp(PC.sizeDust[0], PC.sizeDust[1], rnd()),
+        bright: PC.brightDust * (0.50 + rnd() * 0.80),
+        phase: rnd() * TAU,
+        lag: 0,
+        kind: 3,
+        rank: 0.10 + rnd() * 0.10,
+        z: (rnd() - 0.5) * 40
       });
     }
-    /* 星芒：稀疏纯白十字，闪现即隐，制造细碎高光 */
-    this.glints = [];
-    for (i = 0; i < L.glintsPerFlower; i++) {
+
+    /* ---------- 5) 十字星芒：稀疏闪现的高光 ---------- */
+    for (i = 0; i < PC.glintCount; i++) {
       var ga = rnd() * TAU;
-      var gr = (0.18 + rnd() * 0.92) * WH[0].radiusOpen;
-      this.glints.push({
-        x: Math.cos(ga) * gr, y: Math.sin(ga) * gr * F.flatten,
-        ph: rnd() * TAU, len: 0.55 + rnd() * 0.85,
-        ci: rnd() > 0.4 ? GLINT_I : HALO_I
+      var gr = R0 * (0.18 + rnd() * 1.50);
+      var gx = Math.cos(ga) * gr, gy = Math.sin(ga) * gr * F.flatten;
+      pts.push({
+        ox: gx, oy: gy, cx: gx * 0.18, cy: gy * 0.18,
+        col: GLINT,
+        size: lerp(PC.sizeGlint[0], PC.sizeGlint[1], rnd()),
+        bright: PC.brightGlint * (0.60 + rnd() * 0.60),
+        phase: rnd() * TAU,
+        lag: rnd() * 0.20,
+        kind: 4,
+        rank: 0.40 + rnd() * 0.06,
+        z: 0
       });
     }
-    this.count = pts.length;
-  };
 
-  Flower.prototype.place = function (x, y, o, scale, alpha) {
-    this.x = x; this.y = y;
-    this.openness = o; this.scale = scale;
-    this.alpha = alpha === undefined ? 1 : alpha;
-  };
-
-  Flower.prototype.burst = function () {
-    var pts = this.particles;
-    for (var i = 0; i < pts.length; i++) {
-      var pt = pts[i];
-      var d = Math.sqrt(pt.x * pt.x + pt.y * pt.y) || 1;
-      var k = (0.5 + Math.random() * 0.8) * P.burstSpeed;
-      pt.vx += (pt.x / d) * k;
-      pt.vy += (pt.y / d) * k;
+    /* ---------- 6) 花苞位形重映射：竖直纺锤光蕾 ----------
+     * 旧做法是让参数化花瓣「原地收拢」（外轮 lenClosed 46 / radiusClosed 20），
+     * 结果 12 万粒子被压进半径 20 的圆里，闭合成一个几十像素的白点，
+     * 完全看不出「这儿有一朵花在等着开」。
+     *
+     * 现在按每个粒子【全开时的极角 a】和【归一化半径 rn】把它投到一枚
+     * 竖直纺锤形光蕾上：
+     *   · 高度 = rn → 同一根放射丝的所有点落在同一条竖线上，
+     *     闭合时是一条竖向光丝，蕾身有丝绒般的纵向纹理
+     *   · 横向 = sin 纺锤轮廓 × 9 瓣起伏 → 底圆、中饱、尖聚
+     *   · 螺旋 0.85 rad → 瓣缘有一道包卷走势，又不至于交叉成网
+     * 因为纺锤的角度集中在上方，着色器里不能直接用极坐标插值，
+     * 改用「角度先旋开、半径后生长」的分段插值（见 VS_PT）。
+     */
+    /* 椭圆盘而不是纺锤：纺锤的极角集中在上下两端，做极坐标插值时角度要
+     * 从「上下」转到「四周」，跨 ±π 会把粒子撕成两半，中间留一道黑洞。
+     * 椭圆盘的角度天然均匀（就是全开时的极角），只让半径生长即可。 */
+    var BUD_CY = -16, BUD_W = 104, BUD_H = 158, BUD_CY_CORE = 4;
+    var budTmp = { x: 0, y: 0 };
+    function budShape(a, rn, out) {
+      var cs = Math.cos(a), sn = Math.sin(a);
+      var lobe = Math.pow(Math.abs(Math.cos(a * 4.5)), 0.55);
+      /* 顶端收四成、底端收一成半：蕾尖聚拢、蕾底圆润 */
+      var top = Math.max(0, -sn), bot = Math.max(0, sn);
+      var narrow = 1 - 0.40 * top * top - 0.16 * bot * bot;
+      out.x = cs * BUD_W * rn * (0.84 + 0.16 * lobe);
+      out.y = BUD_CY + sn * BUD_H * rn * narrow;
+      out.edge = Math.pow(Math.abs(cs), 0.85);   // 1 = 轮廓侧，0 = 正中
+      return out;
     }
-  };
+    for (i = 0; i < pts.length; i++) {
+      var bp = pts[i];
+      var kk = bp.kind;
+      if (kk === 3) continue;                    // 浮尘铺满全屏，不参与收拢
+      var oa = Math.atan2(bp.oy / F.flatten, bp.ox);
+      var orr0 = Math.sqrt(bp.ox * bp.ox + bp.oy * bp.oy);
+      if (kk === 1) {
+        /* 花心始终守在蕾心：它就是花心，不该被摊到蕾身中段。
+         * 注意不能借 budShape —— 它的 taper 会把 rn=0.1 抬到半径 70 多，
+         * 插值到中间态就成了一圈环、正中一个黑洞。这里直接铺一个小椭圆。 */
+        var crad = Math.sqrt(rnd());
+        bp.cx = Math.cos(oa) * 34 * crad;
+        bp.cy = BUD_CY_CORE + Math.sin(oa) * 52 * crad;
+        continue;
+      }
+      if (kk === 4) {
+        /* 星芒：轻度收拢，仍在花蕾外围闪，保留空间感 */
+        bp.cx *= 0.40; bp.cy = bp.cy * 0.40 - 16;
+        bp.bright *= 0.72;
+        continue;
+      }
+      /* 花瓣 / 放射丝 / 金环：投到蕾身。
+       * 花瓣的全开半径最小也有 radiusOpen(66)，直接除以 R0 会整体落在 0.4
+       * 以外，蕾心只能靠花心那几千个点撑。这里按【花轮 lag】认出本层，
+       * 用 (r - 55)/(层半径 - 55) 归一化 —— 每层都从蕾心铺到蕾缘，蕾身才实心。
+       * 放射丝跨度太大（60~530），单开 0.62 次方压一压。 */
+      var rn;
+      if (kk === 0) {
+        var layerMax = bp.lag < 0.06 ? 318 : (bp.lag < 0.18 ? 235 : 152);
+        rn = clamp((orr0 - 55) / (layerMax - 55), 0, 1);
+      } else {
+        rn = Math.pow(clamp(orr0 / 530, 0, 1), 0.62);
+      }
+      budShape(oa, rn, budTmp);
+      bp.cx = budTmp.x;
+      bp.cy = budTmp.y;
+      /* 亮度层次不放这里：bright 是全局属性，烘焙时乘下去会连带改变
+       * 全开态（花瓣正面被压暗 16%，实心光瓣就散成了丝）。改由着色器
+       * 按 oe 混合 —— 见 VS_PT 里的 edgeC。 */
+    }
 
-  /* ---------- 引擎 ---------- */
-  function Engine(canvas) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext('2d', { alpha: false });
-    this.W = 1; this.H = 1; this.dpr = 1;
-    this.flowers = {};
-    this.sparks = [];
-    this.wind = { x: 0, y: 0 };
-    this.quality = 1;
-    this.frameTimes = [];
-    this.pal = buildPalette();
-    this.reduce = global.matchMedia &&
-      global.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    this.lastNow = 0;
-    this._tmp = { x: 0, y: 0, oe: 0 };
+    /* ---------- 排序：rank 降序，降质时少画尾部即可 ---------- */
+    pts.sort(function (a, b) { return b.rank - a.rank; });
+
+    var n = pts.length;
+    var data = new Float32Array(n * STRIDE_F);
+    for (i = 0; i < n; i++) {
+      var q = pts[i], o = i * STRIDE_F;
+      data[o] = q.ox; data[o + 1] = q.oy;
+      data[o + 2] = q.cx; data[o + 3] = q.cy;
+      data[o + 4] = q.col[0]; data[o + 5] = q.col[1]; data[o + 6] = q.col[2];
+      data[o + 7] = q.size;
+      data[o + 8] = q.bright;
+      data[o + 9] = q.phase;
+      data[o + 10] = q.lag;
+      data[o + 11] = q.kind;
+    }
+    return { data: data, total: n };
   }
 
+  /* ============================================================
+   * 着色器（WebGL1 / GLSL ES 1.00，写法刻意保守以兼容老驱动）
+   * ============================================================ */
+
+  var VS_BG = [
+    'attribute vec2 a_pos;',
+    'varying vec2 v_uv;',
+    'void main() {',
+    '  v_uv = a_pos * 0.5 + 0.5;',
+    '  gl_Position = vec4(a_pos, 0.0, 1.0);',
+    '}'
+  ].join('\n');
+
+  var FS_BG = [
+    'precision mediump float;',
+    'varying vec2 v_uv;',
+    'uniform vec2 u_res;',
+    'uniform vec2 u_center;',
+    'uniform float u_glow;',
+    'uniform vec3 u_deep;',
+    'uniform vec3 u_glowCol;',
+    'uniform float u_vig;',
+    'void main() {',
+    '  vec2 d = (v_uv * u_res - u_center) / max(u_res.y, 1.0);',
+    '  float r = length(d);',
+    '  float halo = exp(-r * r * 2.4) * (0.30 + 0.70 * u_glow);',
+    '  vec3 col = u_deep + u_glowCol * halo;',
+    /* 中心八向星芒：参考图的白核外面有清晰的镜头光芒，纯靠粒子堆不出来。
+     * cos(4θ) 在 2π 内有 8 个峰，pow 收紧成尖细的光条，再按半径快速衰减。
+     * 画在背景层 → 中心的实心白核会盖住它，只有伸出去的部分留在花外。 */
+    '  float ang = atan(d.y, d.x + 0.00001);',
+    '  float rays = pow(abs(cos(ang * 4.0)), 42.0);',
+    '  float rayLen = exp(-r * 3.6);',
+    '  col += vec3(0.98, 0.62, 0.78) * rays * rayLen * (0.03 + 0.09 * u_glow);',
+    '  vec2 c = v_uv - vec2(0.5);',
+    '  float vig = 1.0 - u_vig * smoothstep(0.34, 0.96, length(c));',
+    '  col *= vig;',
+    '  float n = fract(sin(dot(v_uv * u_res, vec2(12.9898, 78.233))) * 43758.5453);',
+    '  col += vec3((n - 0.5) * 0.008);',
+    '  gl_FragColor = vec4(col, 1.0);',
+    '}'
+  ].join('\n');
+
+  var VS_PT = [
+    'precision highp float;',
+    'attribute vec2 a_open;',
+    'attribute vec2 a_close;',
+    'attribute vec3 a_color;',
+    'attribute float a_size;',
+    'attribute float a_bright;',
+    'attribute float a_phase;',
+    'attribute float a_lag;',
+    'attribute float a_kind;',
+    'uniform float u_time;',
+    'uniform float u_open;',
+    'uniform vec2 u_center;',
+    'uniform float u_scale;',
+    'uniform vec2 u_res;',
+    'uniform float u_dpr;',
+    'uniform vec2 u_pointer;',
+    'uniform float u_pointerOn;',
+    'uniform vec2 u_wind;',
+    'uniform float u_pulse;',
+    'uniform float u_seed;',
+    'uniform float u_bright;',
+    'uniform float u_alpha;',
+    'uniform float u_maxSize;',
+    'uniform float u_twinkle;',
+    'varying vec3 v_color;',
+    'varying float v_alpha;',
+    'varying float v_kind;',
+    'void main() {',
+    '  float lag = clamp(a_lag, 0.0, 0.92);',
+    '  float oe = clamp((u_open - lag) / max(1.0 - lag, 0.001), 0.0, 1.0);',
+    '  oe = oe * oe * (3.0 - 2.0 * oe);',
+    '  float kind = a_kind;',
+    /* 位形插值：不能所有粒子都直线 mix —— 花苞是竖直的、全开是摊平的，
+     * 直线插值会让中间态「趴」成一团横向火苗。花瓣/放射丝改走极坐标：
+     * 角度基本不变、只让半径生长，花就像从蕾里一层层翻出来。 */
+    '  vec2 local;',
+    '  if (kind > 0.5 && kind < 1.5) {',
+    /* 花心先归位：它本来就该一直在中心。若和花瓣同步插值，中途会被摊到
+     * 一圈环上，画面正中反而出现一个椭圆黑洞。 */
+    '    local = mix(a_close, a_open, min(1.0, oe * 1.7));',
+    '  } else if (kind > 2.5) {',
+    '    local = mix(a_close, a_open, oe);',   // 浮尘 / 星芒：环境层，直线最稳
+    '  } else {',
+    '    float rC = length(a_close);',
+    '    float rO = length(a_open);',
+    '    float aC = atan(a_close.y, a_close.x);',
+    '    float aO = atan(a_open.y, a_open.x);',
+    '    float da = aO - aC;',
+    '    da = mod(da + 3.14159265, 6.2831853) - 3.14159265;',
+    /* 角度先旋开、半径后生长：纺锤花蕾的角度集中在上方，若两者同步插值，
+     * 半开时花瓣还全挤在上半圈，整朵花是「趴」着的。先把角度转到全开的
+     * 分布（oe*1.7 提前转完），半径再跟上，过程才像花瓣一层层翻开。 */
+    '    float rr = mix(rC, rO, pow(oe, 1.55));',
+    '    float av = aC + da * min(1.0, oe * 1.7);',
+    '    local = vec2(cos(av), sin(av)) * rr;',
+    '  }',
+    '  float ph = a_phase + u_seed;',
+    '  float t = u_time;',
+    '  local += vec2(sin(t * 0.85 + ph), cos(t * 0.66 + ph * 1.3)) * 1.6 * (1.0 + 1.4 * oe);',
+    '  if (kind > 1.5 && kind < 2.5) {',
+    '    float flow = 0.5 + 0.5 * sin(t * 1.5 + ph);',
+    '    local *= 1.0 + 0.05 * flow;',
+    '  }',
+    '  if (kind > 2.5 && kind < 3.5) {',
+    '    local += vec2(sin(t * 0.17 + ph), cos(t * 0.13 + ph * 1.7)) * 16.0;',
+    '  }',
+    '  local *= 1.0 + u_pulse * 0.16;',
+    '  local += u_wind;',
+    '  vec2 pointerLocal = (u_pointer - u_center) / max(u_scale, 0.0001);',
+    '  vec2 dp = local - pointerLocal;',
+    '  float dpLen = length(dp) + 0.0001;',
+    '  float infl = u_pointerOn * max(0.0, 1.0 - dpLen / 150.0);',
+    '  local += (dp / dpLen) * infl * infl * 34.0;',
+    '  vec2 screen = u_center + local * u_scale;',
+    '  vec2 clip = (screen / u_res) * 2.0 - 1.0;',
+    '  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);',
+    '  float tw = 0.70 + 0.30 * sin(t * u_twinkle + ph * 6.2831);',
+    '  float depth = 1.0 + 0.42 * (1.0 - clamp(length(a_open) / 420.0, 0.0, 1.0));',
+    '  float ps = a_size * u_scale * u_dpr * depth * tw * (1.0 + u_pulse * 0.55) * (0.86 + 0.14 * oe);',
+    '  gl_PointSize = clamp(ps, 1.0, u_maxSize);',
+    '  float kindA = 1.0;',
+    '  if (kind > 0.5 && kind < 1.5) { kindA = 1.35; }',
+    '  else if (kind > 1.5 && kind < 2.5) { kindA = 1.05; }',
+    '  else if (kind > 2.5 && kind < 3.5) { kindA = 0.55; }',
+    '  else if (kind > 3.5) { kindA = 0.90; }',
+    '  float a = a_bright * kindA * u_bright * u_alpha * (0.55 + 0.45 * tw);',
+    '  if (kind > 3.5) { a *= tw * tw * tw; }',
+    /* 花苞态让放射丝退到幕后：900 条丝在闭合时是 900 根「针」，把蕾身
+     * 扎成一束针叶。这里按 oe 把它们压暗并内收，蕾身交回高密度的花瓣本体，
+     * 丝只留下一点丝绒纹理；绽放后再恢复成主角。 */
+    '  if (kind > 1.5 && kind < 2.5) {',
+    '    a *= 0.48 + 0.52 * oe;',
+    '  }',
+    /* 收拢时略压暗：花苞是一枚安静的光蕾，绽放才该亮起来。
+     * 但压太狠会让闭合态显得死气沉沉 —— 0.76 起步，只做轻微收敛。 */
+    '  a *= 0.90 + 0.10 * oe;',
+    /* 花苞的明暗层次：蕾身轮廓侧受光更亮、正面背光稍暗。必须按 oe 混回 1，
+     * 否则会把全开的实心瓣面一起压暗。 */
+    '  float edgeC = 0.0;',
+    '  if (length(a_close) > 0.001) { edgeC = abs(normalize(a_close).x); }',
+    '  a *= mix(0.84 + 0.44 * edgeC, 1.0, oe);',
+    '  if (kind > 0.5 && kind < 1.5) { a *= mix(1.15, 1.0, oe); }',
+    /* 收拢时向白色提亮一点：花瓣在花苞里是「背光透光」的，
+     * 仍是深玫红会显得发黑，混 20% 白才有蕾内透光的感觉。 */
+    '  v_color = mix(a_color, vec3(1.0), 0.20 * (1.0 - oe));',
+    '  v_alpha = a;',
+    '  v_kind = kind;',
+    '}'
+  ].join('\n');
+
+  var FS_PT = [
+    'precision mediump float;',
+    'varying vec3 v_color;',
+    'varying float v_alpha;',
+    'varying float v_kind;',
+    'void main() {',
+    '  vec2 pc = gl_PointCoord - vec2(0.5);',
+    '  float d2 = dot(pc, pc) * 4.0;',
+    '  if (d2 > 1.0) { discard; }',
+    /* 点的衰减更柔：核心别太尖、光晕给足，几万个点才会融成一片光雾，
+     * 而不是一粒粒能数出来的沙子。 */
+    '  float core = exp(-d2 * 1.75);',
+    '  float halo = exp(-d2 * 1.05) * 0.62;',
+    '  float a = core + halo;',
+    '  if (v_kind > 3.5) {',
+    '    float cx = 1.0 / (1.0 + 120.0 * abs(pc.x)) * exp(-abs(pc.y) * 11.0);',
+    '    float cy = 1.0 / (1.0 + 120.0 * abs(pc.y)) * exp(-abs(pc.x) * 11.0);',
+    '    a = core * 0.8 + halo * 0.5 + (cx + cy) * 0.34;',
+    '  }',
+    '  float alpha = a * v_alpha;',
+    '  if (alpha < 0.004) { discard; }',
+    '  vec3 c = v_color * (0.86 + 1.12 * core) + vec3(core * core * 0.52);',
+    '  gl_FragColor = vec4(c * alpha, alpha);',
+    '}'
+  ].join('\n');
+
+  var VS_SP = [
+    'precision highp float;',
+    'attribute vec2 a_pos;',
+    'attribute vec3 a_color;',
+    'attribute float a_size;',
+    'attribute float a_alpha;',
+    'uniform vec2 u_res;',
+    'uniform float u_dpr;',
+    'uniform float u_maxSize;',
+    'varying vec3 v_color;',
+    'varying float v_alpha;',
+    'void main() {',
+    '  vec2 clip = (a_pos / u_res) * 2.0 - 1.0;',
+    '  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);',
+    '  gl_PointSize = clamp(a_size * u_dpr, 1.0, u_maxSize);',
+    '  v_color = a_color;',
+    '  v_alpha = a_alpha;',
+    '}'
+  ].join('\n');
+
+  var FS_SP = [
+    'precision mediump float;',
+    'varying vec3 v_color;',
+    'varying float v_alpha;',
+    'void main() {',
+    '  vec2 pc = gl_PointCoord - vec2(0.5);',
+    '  float d2 = dot(pc, pc) * 4.0;',
+    '  if (d2 > 1.0) { discard; }',
+    '  float core = exp(-d2 * 10.0);',
+    '  float halo = exp(-d2 * 2.4) * 0.5;',
+    '  float a = (core + halo) * v_alpha;',
+    '  if (a < 0.004) { discard; }',
+    '  gl_FragColor = vec4(v_color * (0.8 + 1.1 * core) * a, a);',
+    '}'
+  ].join('\n');
+
+  /* ============================================================ */
+  function Engine(canvas, gl) {
+    this.canvas = canvas;
+    this.gl = gl;
+    this.ok = false;
+    this.baked = false;
+    this.total = 0;
+    this.quality = 1;
+    this.frameTimes = [];
+    this.W = 1; this.H = 1; this.dpr = 1; this.fit = 1;
+    this.flowers = {};
+    this.sparks = [];
+    this.sparkData = new Float32Array(PC.sparkMax * 7);
+    this.wind = { x: 0, y: 0 };
+    this.pulse = 0;
+    this.lastNow = 0;
+    this.locCache = {};
+    this.sparkCore = hex01(C.spark);
+    this.sparkCoreHot = hex01(PC.coreHot);
+    this.sparkWhite = [1, 1, 1];
+  }
+
+  /* ---------- 着色器编译 ---------- */
+  Engine.prototype._shader = function (type, src, tag) {
+    var gl = this.gl;
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      if (global.console && console.error) {
+        console.error('[yshnb/bloom] 着色器编译失败 (' + tag + ')：', gl.getShaderInfoLog(s));
+      }
+      gl.deleteShader(s);
+      return null;
+    }
+    return s;
+  };
+
+  Engine.prototype._program = function (vsSrc, fsSrc, tag) {
+    var gl = this.gl;
+    var vs = this._shader(gl.VERTEX_SHADER, vsSrc, tag + '.vs');
+    var fs = this._shader(gl.FRAGMENT_SHADER, fsSrc, tag + '.fs');
+    if (!vs || !fs) return null;
+    var prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      if (global.console && console.error) {
+        console.error('[yshnb/bloom] 程序链接失败 (' + tag + ')：', gl.getProgramInfoLog(prog));
+      }
+      gl.deleteProgram(prog);
+      return null;
+    }
+    return prog;
+  };
+
+  Engine.prototype._u = function (pn, name) {
+    var k = pn + '|' + name;
+    if (!(k in this.locCache)) {
+      this.locCache[k] = this.gl.getUniformLocation(this['prog' + pn.toUpperCase()], name);
+    }
+    return this.locCache[k];
+  };
+  Engine.prototype._a = function (pn, name) {
+    var k = 'a' + pn + '|' + name;
+    if (!(k in this.locCache)) {
+      this.locCache[k] = this.gl.getAttribLocation(this['prog' + pn.toUpperCase()], name);
+    }
+    return this.locCache[k];
+  };
+
+  Engine.prototype._init = function () {
+    var gl = this.gl;
+    this.progBG = this._program(VS_BG, FS_BG, 'bg');
+    this.progPT = this._program(VS_PT, FS_PT, 'pt');
+    this.progSP = this._program(VS_SP, FS_SP, 'sp');
+    if (!this.progBG || !this.progPT || !this.progSP) { this.ok = false; return; }
+
+    this.vboQuad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboQuad);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+    this.vboSP = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboSP);
+    gl.bufferData(gl.ARRAY_BUFFER, this.sparkData.byteLength, gl.DYNAMIC_DRAW);
+
+    this.vboPT = gl.createBuffer();
+
+    this.bgDeep = hex01(PC.bgDeep);
+    this.bgGlow = hex01(PC.bgGlow);
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    /* 片元输出的是预乘颜色 (c*a, a)，所以必须用 ONE/ONE 做加法；
+     * 若写成 SRC_ALPHA/ONE，亮度会被 alpha 再乘一次（平方），粒子明显发暗。 */
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.clearColor(this.bgDeep[0], this.bgDeep[1], this.bgDeep[2], 1);
+    this.ok = true;
+  };
+
+  /* ---------- 烘焙（延后到首次绘制，避免拖慢首屏） ---------- */
+  Engine.prototype._bakeNow = function () {
+    if (this.baked) return;
+    this.baked = true;
+    var gl = this.gl;
+    var res = bake();
+    this.total = res.total;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboPT);
+    gl.bufferData(gl.ARRAY_BUFFER, res.data, gl.STATIC_DRAW);
+  };
+
   Engine.prototype.resize = function (W, H) {
-    this.dpr = Math.min(global.devicePixelRatio || 1, R.maxDpr);
-    this.W = W; this.H = H;
-    this.canvas.width = Math.round(W * this.dpr);
-    this.canvas.height = Math.round(H * this.dpr);
-    this.canvas.style.width = W + 'px';
-    this.canvas.style.height = H + 'px';
-    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.ctx.fillStyle = C.bg;
-    this.ctx.fillRect(0, 0, W, H);
+    this.dpr = Math.min(global.devicePixelRatio || 1, PC.dprCap);
+    this.W = Math.max(1, W);
+    this.H = Math.max(1, H);
+    var cw = Math.max(1, Math.round(this.W * this.dpr));
+    var ch = Math.max(1, Math.round(this.H * this.dpr));
+    if (this.canvas.width !== cw) this.canvas.width = cw;
+    if (this.canvas.height !== ch) this.canvas.height = ch;
+    this.canvas.style.width = this.W + 'px';
+    this.canvas.style.height = this.H + 'px';
+    this.gl.viewport(0, 0, cw, ch);
+    /* 基准 660 而不是 820：旧值下花只占画面约 3/4 高，参考图是铺满，
+     * 逐步把花瓣推到接近画幅边缘才有那种「炸开」的压迫感。 */
+    this.fit = clamp(Math.min(this.W, this.H) / 660, 0.60, 2.10);
   };
 
-  Engine.prototype.getFlower = function (desc) {
-    var f = this.flowers[desc.id];
-    if (!f) { f = new Flower(desc.seed); this.flowers[desc.id] = f; }
-    return f;
-  };
-
+  /* ---------- 事件 ---------- */
   Engine.prototype.addSparks = function (x, y, n, which) {
-    var idx = (which === 'glint' || which === 1) ? GLINT_I
-            : (which === 'core' || which === 3) ? CORE_I : SPARK_I;
+    var W = this.W, H = this.H;
+    if (typeof x !== 'number' || !isFinite(x)) x = W * 0.5;
+    if (typeof y !== 'number' || !isFinite(y)) y = H * 0.52;
+    var col = (which === 'glint' || which === 1) ? this.sparkWhite
+            : (which === 'core' || which === 3) ? this.sparkCoreHot
+            : this.sparkCore;
+    /* 出生时间必须和 render 的 now 同一时钟源：优先复用上一帧时间戳，
+     * 否则一旦 performance.now() 与 rAF 时间戳基准不同，火花就永不消亡。 */
+    var now = this.lastNow ||
+      ((global.performance && global.performance.now) ? global.performance.now() : Date.now());
     for (var i = 0; i < n; i++) {
-      if (this.sparks.length >= R.sparkMax) break;
+      if (this.sparks.length >= PC.sparkMax) break;
       var a = Math.random() * TAU;
-      var sp = 0.8 + Math.random() * 3.8;
+      var sp = 0.8 + Math.random() * 4.2;
       this.sparks.push({
-        x: x, y: y, px: x, py: y,
-        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 0.5,
-        born: performance.now(), size: 2.4 + Math.random() * 4.2,
-        color: Math.random() < 0.22 ? GLINT_I : idx
+        x: x, y: y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp - 0.4,
+        born: now,
+        size: 2.2 + Math.random() * 4.8,
+        col: Math.random() < 0.18 ? this.sparkWhite : col
       });
     }
   };
 
   Engine.prototype.handleEvents = function (events, desc) {
+    var W = this.W, H = this.H;
     for (var i = 0; i < events.length; i++) {
       var e = events[i];
       if (e.type === 'pulse') {
-        Object.keys(this.flowers).forEach(function (k) {
-          if (this.flowers[k] && desc.flowers.some(function (d) { return String(d.id) === k; })) {
-            this.flowers[k].burst();
-          }
-        }, this);
+        this.pulse = 1;
         this.addSparks(e.x, e.y, P.burstCount, 'spark');
       } else if (e.type === 'newbud') {
-        this.addSparks(e.x, e.y, 30, 'core');
+        this.pulse = Math.max(this.pulse, 0.55);
+        this.addSparks(e.x, e.y, 34, 'core');
       } else if (e.type === 'gust') {
         this.wind.x += clamp(e.x, -1, 1) * P.windStrength * (e.vx || 1);
         this.wind.y += clamp(e.y, -1, 1) * P.windStrength * (e.vy || 1);
-        this.addSparks(this.W / 2, this.H / 2, 20, 'glint');
+        this.addSparks(W / 2, H / 2, 22, 'glint');
       }
     }
   };
 
-  /* 极淡粉灰线茎与叶：暗底上只留一线微光，不抢花 */
-  Engine.prototype.drawStem = function (x, y, o) {
-    if (!F.drawStem) return;
-    var g = this.ctx;
-    var top = y + lerp(WH[2].radiusClosed, WH[2].radiusOpen, o) * 0.42;
-    var bottom = this.H + 24;
-    g.globalCompositeOperation = 'source-over';
-    g.strokeStyle = rgba(C.stem, 0.10);
-    g.lineWidth = 1;
-    g.beginPath();
-    g.moveTo(x, top);
-    g.bezierCurveTo(x - 16, top + 150, x + 20, bottom - 170, x + 5, bottom);
-    g.stroke();
-    for (var k = 0; k < 2; k++) {
-      var ly = top + 190 + k * 150;
-      var dir = k % 2 === 0 ? -1 : 1;
-      g.beginPath();
-      g.moveTo(x + 3, ly);
-      g.quadraticCurveTo(x + dir * 52, ly - 34, x + dir * 76, ly + 6);
-      g.quadraticCurveTo(x + dir * 46, ly + 30, x + 3, ly);
-      g.strokeStyle = rgba(C.stem, 0.065);
-      g.stroke();
-    }
-  };
-
+  /* ---------- 摄像头小窗骨架（仍是 2D，画在独立的 skeleton canvas 上） ---------- */
   Engine.prototype.drawSkeleton = function (ctx, hand, w, h) {
-    if (!hand || !hand.landmarks || !hand.landmarks.length) return;
+    if (!ctx || !hand || !hand.landmarks || !hand.landmarks.length) return;
     var LM = hand.landmarks;
-    var CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
-                [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
-                [13,17],[17,18],[18,19],[19,20],[0,17]];
+    var CONN = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8],
+                [5, 9], [9, 10], [10, 11], [11, 12], [9, 13], [13, 14], [14, 15], [15, 16],
+                [13, 17], [17, 18], [18, 19], [19, 20], [0, 17]];
     ctx.clearRect(0, 0, w, h);
     ctx.strokeStyle = rgba(C.sage, R.skeletonAlpha);
     ctx.lineWidth = 1.1;
@@ -391,372 +888,228 @@
     }
   };
 
+  /* ---------- 每朵花画多少点：小花苞按 scale 取前缀 ---------- */
+  Engine.prototype._drawCount = function (d) {
+    var base = this.total * this.quality;
+    if (d.kind === 'bud') {
+      var f = clamp((d.scale || 0.34) * 1.55, 0.16, 0.62);
+      return Math.max(400, Math.floor(base * f));
+    }
+    return Math.floor(base);
+  };
+
+  /* ---------- 主渲染 ---------- */
   Engine.prototype.render = function (desc, frame, now) {
-    var g = this.ctx, W = this.W, H = this.H;
-    var dt = this.lastNow ? Math.min(now - this.lastNow, 40) : 16;
+    var gl = this.gl, W = this.W, H = this.H;
+    if (!W || !H || !this.ok) return;
+    if (!this.baked) this._bakeNow();
+
+    var dt = this.lastNow ? Math.min(now - this.lastNow, 48) : 16;
     this.lastNow = now;
+    var t = now * 0.001;
 
-    /* 铺底：接近不透明，留极短光轨，避免 lighter 累积过曝成白团 */
-    g.globalCompositeOperation = 'source-over';
-    g.globalAlpha = 1;
-    g.fillStyle = rgba(C.bg, this.reduce ? 1 : R.trailFade);
-    g.fillRect(0, 0, W, H);
-
+    this.pulse *= PC.pulseDecay;
     this.wind.x *= P.windDecay;
     this.wind.y *= P.windDecay;
-    var pointer = desc.pointer || (frame.hands[0] ? frame.hands[0].tip : null);
-    var pr = P.pointerRadius, pf = P.pointerForce;
 
     var all = desc.flowers.concat(desc.buds || []);
-    var activeIds = {};
-    for (var n = 0; n < all.length; n++) {
-      var d = all[n];
-      activeIds[d.id] = true;
+    var main = null, maxO = 0;
+    for (var mi = 0; mi < all.length; mi++) {
+      var md = all[mi];
+      if (md.kind === 'primary' || !main) {
+        if (!main || (md.openness || 0) >= maxO) { main = md; maxO = md.openness || 0; }
+      }
+    }
+    var cx = main ? W * (0.5 + (main.x - 0.5) * 0.72) : W * 0.5;
+    var cy = main ? H * (0.5 + (main.y - 0.5) * 0.66) : H * 0.52;
+
+    var pointer = desc.pointer || (frame.hands && frame.hands[0] && frame.hands[0].tip) || null;
+
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+
+    /* ===== 1) 背景：暗紫红渐晕 + 四周压暗 + 细噪点 ===== */
+    gl.disable(gl.BLEND);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(this.progBG);
+    var aPos = this._a('bg', 'a_pos');
+    if (aPos >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.vboQuad);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    }
+    gl.uniform2f(this._u('bg', 'u_res'), W, H);
+    gl.uniform2f(this._u('bg', 'u_center'), cx, cy);
+    /* 花苞（maxO≈0）也要有一团可见的红晕，否则完全闭合时整屏近乎全黑，
+     * 看不出「有一朵花在那儿等着」。0.34 起步，随绽放再升到 0.68。 */
+    gl.uniform1f(this._u('bg', 'u_glow'), 0.44 + 0.26 * clamp(maxO, 0, 1));
+    gl.uniform3f(this._u('bg', 'u_deep'), this.bgDeep[0], this.bgDeep[1], this.bgDeep[2]);
+    gl.uniform3f(this._u('bg', 'u_glowCol'), this.bgGlow[0], this.bgGlow[1], this.bgGlow[2]);
+    gl.uniform1f(this._u('bg', 'u_vig'), PC.vignette);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    /* ===== 2) 粒子花（叠加混合） ===== */
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(this.progPT);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboPT);
+    /* 第三列是【float 索引】，下面乘 4 换成字节偏移。
+     * 早先这里误写成字节偏移（8/16/28…）又乘了一次 4：
+     * a_lag 的指针实际落到 160 字节外，读到的是别的粒子颜色通道（≈0.8）。
+     * 于是 oe = (u_open - 0.8) / 0.2 —— 张开度低于 0.8 时整朵花 oe≈0，
+     * 只剩花心一个白点；只有全开（oe=1）才看起来正常。
+     * 这个 bug 让「半开/花苞」一直是坏的，也让手势控制像失灵。 */
+    var layout = [
+      ['a_open', 2, 0], ['a_close', 2, 2], ['a_color', 3, 4],
+      ['a_size', 1, 7], ['a_bright', 1, 8], ['a_phase', 1, 9],
+      ['a_lag', 1, 10], ['a_kind', 1, 11]
+    ];
+    for (var li = 0; li < layout.length; li++) {
+      var loc = this._a('pt', layout[li][0]);
+      if (loc < 0) continue;
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, layout[li][1], gl.FLOAT, false, STRIDE_F * 4, layout[li][2] * 4);
+    }
+
+    gl.uniform1f(this._u('pt', 'u_time'), t);
+    gl.uniform2f(this._u('pt', 'u_res'), W, H);
+    gl.uniform1f(this._u('pt', 'u_dpr'), this.dpr);
+    gl.uniform2f(this._u('pt', 'u_pointer'), pointer ? pointer.x : 0, pointer ? pointer.y : 0);
+    gl.uniform1f(this._u('pt', 'u_pointerOn'), pointer ? 1 : 0);
+    gl.uniform2f(this._u('pt', 'u_wind'), this.wind.x * 1.2, this.wind.y * 1.2);
+    gl.uniform1f(this._u('pt', 'u_pulse'), this.pulse);
+    /* 属性偏移修好后，点径从 1px 回到真实的 4~9px，覆盖面积大了几十倍，
+     * 旧的 1.5 会把整朵花糊成一团白。0.42 是重新平衡后的总亮度。 */
+    gl.uniform1f(this._u('pt', 'u_bright'), 0.45);
+    gl.uniform1f(this._u('pt', 'u_maxSize'), PC.maxPointSize);
+    gl.uniform1f(this._u('pt', 'u_twinkle'), PC.twinkleSpeed);
+
+    for (var fi = 0; fi < all.length; fi++) {
+      var d = all[fi];
+      if (!d || d.alpha === 0) continue;
       var fx = W * (0.5 + (d.x - 0.5) * 0.72);
       var fy = H * (0.5 + (d.y - 0.5) * 0.66);
-      var flower = this.getFlower(d);
-      flower.place(fx, fy, d.openness, d.scale || 1, d.alpha === undefined ? 1 : d.alpha);
-      if (d.kind === 'primary') this.drawStem(fx, fy, d.openness);
-      this.drawFlower(flower, d, now, dt, pointer, pr, pf);
+      gl.uniform2f(this._u('pt', 'u_center'), fx, fy);
+      gl.uniform1f(this._u('pt', 'u_scale'), (d.scale || 1) * this.fit);
+      gl.uniform1f(this._u('pt', 'u_open'), clamp(d.openness || 0, 0, 1));
+      gl.uniform1f(this._u('pt', 'u_alpha'), d.alpha === undefined ? 1 : d.alpha);
+      gl.uniform1f(this._u('pt', 'u_seed'), (d.seed || 0) * 0.37);
+      gl.drawArrays(gl.POINTS, 0, Math.min(this.total, this._drawCount(d)));
     }
-    Object.keys(this.flowers).forEach(function (k) {
-      if (!activeIds[k]) delete this.flowers[k];
-    }, this);
 
-    this.drawSparks(now, dt);
-    g.globalCompositeOperation = 'source-over';
-    g.globalAlpha = 1;
-  };
-
-  /* 用「中点 + 二次贝塞尔」把采样点连成连续光滑曲线。
-   * 旧版是 10 段 lineTo 直接勾勒，放大后折线感明显、瓣缘粗陋；
-   * 这里让曲线经过每个采样点的邻接中点，得到柔顺的 C1 连续瓣缘。 */
-  function traceSmooth(g, pts) {
-    var n = pts.length;
-    if (n < 3) {
-      for (var q = 0; q < n; q++) {
-        if (q === 0) g.moveTo(pts[q].x, pts[q].y);
-        else g.lineTo(pts[q].x, pts[q].y);
+    /* ===== 3) 火花：事件迸发 / 双击落花雨 ===== */
+    var nSpark = this._updateSparks(now, dt);
+    if (nSpark > 0) {
+      gl.useProgram(this.progSP);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.vboSP);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.sparkData.subarray(0, nSpark * 7));
+      /* 同样：第三列是 float 索引（7 个 float / 粒子） */
+      var sLayout = [['a_pos', 2, 0], ['a_color', 3, 2], ['a_size', 1, 5], ['a_alpha', 1, 6]];
+      for (var si = 0; si < sLayout.length; si++) {
+        var sl = this._a('sp', sLayout[si][0]);
+        if (sl < 0) continue;
+        gl.enableVertexAttribArray(sl);
+        gl.vertexAttribPointer(sl, sLayout[si][1], gl.FLOAT, false, 7 * 4, sLayout[si][2] * 4);
       }
-      return;
-    }
-    g.moveTo(pts[0].x, pts[0].y);
-    for (var i = 1; i < n - 1; i++) {
-      var mx = (pts[i].x + pts[i + 1].x) * 0.5;
-      var my = (pts[i].y + pts[i + 1].y) * 0.5;
-      g.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
-    }
-    var last = pts[n - 1];
-    g.quadraticCurveTo(last.x, last.y, last.x, last.y);
-  }
-
-  /* 采样一条瓣缘（v 固定，u: 0→1），返回屏幕坐标点列 */
-  Engine.prototype._edgePoints = function (wh, count, p, v, o, sway, sc, flower, SEG) {
-    var tmp = this._tmp, pts = [];
-    for (var i = 0; i <= SEG; i++) {
-      petalPoint(wh, count, p, i / SEG, v, o, sway, tmp);
-      pts.push({ x: flower.x + tmp.x * sc, y: flower.y + tmp.y * sc });
-    }
-    return pts;
-  };
-
-  /* 花瓣面 + 瓣缘：给粒子层垫一层「纱」，花才有实体而非散点。
-   * 轮廓、渐变、描边都是矢量绘制，不随性能降质，永远保住精致度。 */
-  Engine.prototype.drawPetals = function (flower, now, alpha, isBud) {
-    if (isBud || flower.openness < 0.035) return;
-    var g = this.ctx, o = flower.openness, sc = flower.scale;
-    var sway = F.swayAmp * Math.sin(now * F.swaySpeed + flower.seed);
-    var tmp = this._tmp;
-    var SEG = F.petalSeg || 26;
-    g.globalCompositeOperation = 'lighter';
-    g.lineJoin = 'round';
-    g.lineCap = 'round';
-
-    for (var w = 0; w < WH.length; w++) {
-      var wh = WH[w], count = wh.count;
-      /* 该层的有效开放度决定面与描边的可见度 */
-      var oe = clamp((o - (wh.lag || 0)) / (1 - (wh.lag || 0)), 0, 1);
-      if (oe < 0.02) continue;
-      for (var p = 0; p < count; p++) {
-        /* 瓣心柔光：让每片花瓣自己透亮，而非只有边缘亮 */
-        petalPoint(wh, count, p, 0.55, 0, o, sway, tmp);
-        var halo = wh.lenOpen * L.haloScale * oe * sc;
-        g.globalAlpha = L.haloAlpha * oe * alpha;
-        g.drawImage(this.pal[HALO_I],
-          flower.x + tmp.x * sc * 0.72 - halo / 2,
-          flower.y + tmp.y * sc * 0.72 - halo / 2, halo, halo);
-        g.globalAlpha = 1;
-
-        /* 根点 / 尖点：给瓣面与主脉的渐变定方向 */
-        petalPoint(wh, count, p, 0.02, 0, o, sway, tmp);
-        var rx = flower.x + tmp.x * sc, ry = flower.y + tmp.y * sc;
-        petalPoint(wh, count, p, 0.98, 0, o, sway, tmp);
-        var tx = flower.x + tmp.x * sc, ty = flower.y + tmp.y * sc;
-
-        /* 闭合轮廓：左缘 0→1、右缘 1→0，贝塞尔连成光滑曲线 */
-        var left = this._edgePoints(wh, count, p, -1, o, sway, sc, flower, SEG);
-        var right = this._edgePoints(wh, count, p, 1, o, sway, sc, flower, SEG);
-        var ring = left.concat(right.slice().reverse());
-        g.beginPath();
-        traceSmooth(g, ring);
-        g.closePath();
-
-        /* 瓣面：根深尖透的线性渐变，薄纱透光 */
-        var grd = g.createLinearGradient(rx, ry, tx, ty);
-        grd.addColorStop(0, rgba(wh.root, F.faceAlpha * oe * alpha));
-        grd.addColorStop(0.42, rgba(wh.glow, F.faceAlpha * 0.72 * oe * alpha));
-        grd.addColorStop(1, rgba(wh.tip, F.faceTipAlpha * oe * alpha));
-        g.fillStyle = grd;
-        g.fill();
-
-        /* 三层瓣缘：柔光宽边 → 亮边，勾出轮廓与体积 */
-        g.strokeStyle = rgba(wh.glow, F.edgeSoftAlpha * oe * alpha);
-        g.lineWidth = 2.0;
-        g.stroke();
-        g.strokeStyle = rgba(wh.tip, F.edgeLineAlpha * oe * alpha);
-        g.lineWidth = 0.7;
-        g.stroke();
-
-        /* 内缩细线：沿花心方向收 3.5%，做出瓣缘翻卷的厚度 */
-        g.beginPath();
-        for (var ii = 0; ii < ring.length; ii++) {
-          var ip = ring[ii];
-          var ix = flower.x + (ip.x - flower.x) * 0.965;
-          var iy = flower.y + (ip.y - flower.y) * 0.965;
-          if (ii === 0) g.moveTo(ix, iy); else g.lineTo(ix, iy);
-        }
-        g.closePath();
-        g.strokeStyle = rgba(wh.glow, F.edgeInnerAlpha * oe * alpha);
-        g.lineWidth = 0.55;
-        g.stroke();
-
-        /* 主脉：根→尖渐隐的细线，给花瓣一条挺立的中脊 */
-        var mid = this._edgePoints(wh, count, p, 0, o, sway, sc, flower, SEG);
-        g.beginPath();
-        traceSmooth(g, mid);
-        var mg = g.createLinearGradient(rx, ry, tx, ty);
-        mg.addColorStop(0, rgba(wh.root, F.midribAlpha * oe * alpha));
-        mg.addColorStop(0.7, rgba(wh.glow, F.midribAlpha * 0.45 * oe * alpha));
-        mg.addColorStop(1, rgba(wh.tip, 0));
-        g.strokeStyle = mg;
-        g.lineWidth = 0.6;
-        g.stroke();
-
-        /* 侧脉：两条从瓣根发散到瓣缘的极淡弧线 */
-        for (var vd = -1; vd <= 1; vd += 2) {
-          g.beginPath();
-          for (var si = 0; si <= 8; si++) {
-            var su = si / 8;
-            petalPoint(wh, count, p, 0.04 + su * 0.86, vd * (0.20 + su * 0.62), o, sway, tmp);
-            var sx = flower.x + tmp.x * sc, sy = flower.y + tmp.y * sc;
-            if (si === 0) g.moveTo(sx, sy); else g.lineTo(sx, sy);
-          }
-          g.strokeStyle = rgba(wh.glow, F.veinLineAlpha * oe * alpha);
-          g.lineWidth = 0.5;
-          g.stroke();
-        }
-
-        /* 瓣尖高光：极小的亮点，像停在瓣尖的露珠 */
-        g.globalAlpha = F.tipGlintAlpha * oe * alpha;
-        var tg = 2.6 * sc;
-        g.drawImage(this.pal[GLINT_I], tx - tg, ty - tg, tg * 2, tg * 2);
-        g.globalAlpha = 1;
-      }
+      gl.uniform2f(this._u('sp', 'u_res'), W, H);
+      gl.uniform1f(this._u('sp', 'u_dpr'), this.dpr);
+      gl.uniform1f(this._u('sp', 'u_maxSize'), PC.maxPointSize);
+      gl.drawArrays(gl.POINTS, 0, nSpark);
     }
   };
 
-  Engine.prototype.drawFlower = function (flower, desc, now, dt, pointer, pr, pf) {
-    var g = this.ctx;
-    var o = flower.openness, sc = flower.scale;
-    var alpha = flower.alpha;
-    var isBud = desc.kind === 'bud';
-    var pts = flower.particles;
-    var breathT = now * P.breathSpeed + flower.seed;
-    var sway = this.reduce ? 0 : F.swayAmp * Math.sin(now * F.swaySpeed + flower.seed);
-    var jitter = this.reduce ? 0 : P.jitter;
-    var q = this.quality * (isBud ? 0.58 : 1);
-    var tmp = this._tmp;
-    var pal = this.pal;
-
-    /* --- 花心双层柔光晕：外层暖晕铺开，内层白核提亮 --- */
-    g.globalCompositeOperation = 'lighter';
-    var gs = L.coreGlowSize * sc * (0.62 + o * 0.38);
-    g.globalAlpha = L.coreGlowAlpha * alpha * (0.48 + o * 0.52);
-    g.drawImage(pal[HALO_I], flower.x - gs / 2, flower.y - gs / 2, gs, gs);
-    var gs2 = L.coreGlow2Size * sc * (0.70 + o * 0.30);
-    g.globalAlpha = L.coreGlow2Alpha * alpha * (0.50 + o * 0.50);
-    g.drawImage(pal[GLINT_I], flower.x - gs2 / 2, flower.y - gs2 / 2, gs2, gs2);
-
-    /* --- 花瓣面 / 描边 --- */
-    this.drawPetals(flower, now, alpha, isBud);
-
-    /* --- 粒子 --- */
-    g.globalCompositeOperation = 'lighter';
-    for (var i = 0; i < pts.length; i++) {
-      var pt = pts[i];
-      if (pt.rank > q) continue;                  // 降质先砍填充，轮廓与脉络始终保留
-
-      var tx, ty;
-      if (pt.kind === 'core') {
-        tx = lerp(pt.cx, pt.ox, o);
-        ty = lerp(pt.cy, pt.oy, o);
-      } else {
-        petalPoint(WH[pt.w], WH[pt.w].count, pt.p, pt.u, pt.v, o, sway, tmp);
-        tx = tmp.x; ty = tmp.y;
-      }
-      /* 呼吸 + 个体相位，让花始终在极轻微地「活」 */
-      tx += Math.sin(breathT + pt.phase) * P.breathAmp;
-      ty += Math.cos(breathT * 0.8 + pt.phase) * P.breathAmp;
-
-      var ax = (tx - pt.x) * P.stiffness;
-      var ay = (ty - pt.y) * P.stiffness;
-
-      /* 指尖排斥（转到花的局部坐标） */
-      if (pointer) {
-        var lpx = (pointer.x - flower.x) / sc;
-        var lpy = (pointer.y - flower.y) / sc;
-        var dx = lpx - pt.x, dy = lpy - pt.y;
-        var d2 = dx * dx + dy * dy;
-        var radius = pr / sc;
-        if (d2 < radius * radius) {
-          var d = Math.sqrt(d2) || 1;
-          var f = (1 - d / radius) * pf;
-          ax -= (dx / d) * f;
-          ay -= (dy / d) * f;
-        }
-      }
-
-      pt.vx = (pt.vx + ax + this.wind.x * 0.055) * P.damping;
-      pt.vy = (pt.vy + ay + this.wind.y * 0.055) * P.damping;
-      pt.x += pt.vx + (Math.random() - 0.5) * jitter;
-      pt.y += pt.vy + (Math.random() - 0.5) * jitter;
-
-      var px = flower.x + pt.x * sc;
-      var py = flower.y + pt.y * sc;
-      var size = pt.size * sc * (pt.kind === 'core' ? (0.82 + o * 0.42) : (0.86 + o * 0.30));
-      var twinkle = (1 - L.twinkleDepth * 0.5) + L.twinkleDepth * 0.5 *
-                     Math.sin(now * L.twinkleSpeed + pt.phase);
-      g.globalAlpha = pt.al * R.particleAlpha * alpha * twinkle;
-      g.drawImage(pal[pt.ci], px - size, py - size, size * 2, size * 2);
-    }
-
-    /* --- 雄蕊：细丝 + 顶端亮点 --- */
-    if (!isBud && o > 0.12) {
-      g.globalCompositeOperation = 'lighter';
-      g.strokeStyle = rgba(C.core, 0.26 * alpha * o);
-      g.lineWidth = 0.7;
-      for (var s = 0; s < flower.stamens.length; s++) {
-        var st = flower.stamens[s];
-        var a = st.a + sway + Math.sin(now * 0.0009 + st.ph) * 0.03;
-        var stLen = lerp(5, 30, o) * st.len * sc;
-        var ex = flower.x + Math.sin(a) * stLen;
-        var ey = flower.y - Math.cos(a) * stLen * F.flatten;
-        g.beginPath();
-        g.moveTo(flower.x, flower.y);
-        g.lineTo(ex, ey);
-        g.stroke();
-        g.globalAlpha = 0.55 * alpha * o;
-        g.drawImage(pal[GLINT_I], ex - 1.8, ey - 1.8, 3.6, 3.6);
-      }
-    }
-
-    /* --- 环境光粒与星芒：细碎亮点让整朵花透亮、有呼吸 --- */
-    this.drawMotes(flower, now, alpha, o);
-    this.drawGlints(flower, now, alpha, o);
-    g.globalAlpha = 1;
-  };
-
-  /* 环境光粒：绕花缓慢浮游，带各自轨道 / 明暗呼吸 / 色温 */
-  Engine.prototype.drawMotes = function (flower, now, alpha, o) {
-    var g = this.ctx, sc = flower.scale;
-    var motes = flower.motes;
-    if (!motes || !motes.length) return;
-    g.globalCompositeOperation = 'lighter';
-    var n = Math.round(motes.length * (0.55 + 0.45 * this.quality));
-    for (var i = 0; i < n; i++) {
-      var m = motes[i];
-      var a = m.a + now * L.moteDrift * m.drift;
-      var rr = m.r * (0.52 + o * 0.55) * sc;
-      var x = flower.x + Math.cos(a) * rr;
-      var y = flower.y + Math.sin(a) * rr * F.flatten
-              + Math.sin(now * L.moteBob * m.bob + m.ph) * 6 * sc;
-      var half = 0.5 + 0.5 * Math.sin(now * L.twinkleSpeed * 1.6 + m.ph);
-      var tw = 0.28 + 0.72 * half * half;
-      var sz = m.size * sc * (0.70 + 0.50 * tw);
-      g.globalAlpha = L.moteAlpha * alpha * tw * (0.45 + o * 0.55);
-      g.drawImage(this.pal[m.ci], x - sz, y - sz, sz * 2, sz * 2);
-    }
-    g.globalAlpha = 1;
-  };
-
-  /* 十字星芒：稀疏纯白，闪现一下即隐，是最细的一层高光 */
-  Engine.prototype.drawGlints = function (flower, now, alpha, o) {
-    var g = this.ctx, sc = flower.scale;
-    var gl = flower.glints;
-    if (!gl || !gl.length || o < 0.08) return;
-    g.globalCompositeOperation = 'lighter';
-    g.strokeStyle = '#FFFFFF';
-    g.lineWidth = 0.7;
-    for (var i = 0; i < gl.length; i++) {
-      var s = gl[i];
-      var t = Math.max(0, Math.sin(now * L.twinkleSpeed * 1.15 + s.ph));
-      var tw = t * t;
-      if (tw < 0.06) continue;
-      var x = flower.x + s.x * sc * (0.55 + o * 0.45);
-      var y = flower.y + s.y * sc * (0.55 + o * 0.45);
-      var len = L.glintLen * s.len * sc * tw;
-      g.globalAlpha = L.glintAlpha * alpha * tw * o;
-      g.beginPath();
-      g.moveTo(x - len, y); g.lineTo(x + len, y);
-      g.moveTo(x, y - len * 0.72); g.lineTo(x, y + len * 0.72);
-      g.stroke();
-      g.drawImage(this.pal[GLINT_I], x - 1.6, y - 1.6, 3.2, 3.2);
-    }
-    g.globalAlpha = 1;
-  };
-
-  Engine.prototype.drawSparks = function (now) {
-    var g = this.ctx, pal = this.pal;
-    g.globalCompositeOperation = 'lighter';
+  Engine.prototype._updateSparks = function (now, dt) {
+    var life = PC.sparkLifeMs;
+    var k = (dt || 16) / 16.67;
+    var out = this.sparkData;
+    var n = 0;
     var keep = [];
     for (var i = 0; i < this.sparks.length; i++) {
       var s = this.sparks[i];
       var age = now - s.born;
-      if (age > R.sparkLifeMs) continue;
-      s.px = s.x; s.py = s.y;
-      s.vx *= 0.972; s.vy = s.vy * 0.972 + 0.022;
-      s.x += s.vx; s.y += s.vy;
-      var a = 1 - age / R.sparkLifeMs;
-      /* 一道极细的流星拖影 */
-      g.globalAlpha = a * 0.26;
-      g.strokeStyle = rgba(C.spark, 1);
-      g.lineWidth = 0.8;
-      g.beginPath();
-      g.moveTo(s.px, s.py);
-      g.lineTo(s.x, s.y);
-      g.stroke();
-      g.globalAlpha = a * 1.0;
-      g.drawImage(pal[s.color], s.x - s.size, s.y - s.size, s.size * 2, s.size * 2);
+      if (age > life) continue;
+      s.vx *= Math.pow(0.972, k);
+      s.vy = s.vy * Math.pow(0.972, k) + 0.022 * k;
+      s.x += s.vx * k;
+      s.y += s.vy * k;
+      var lifeK = 1 - age / life;
+      var o = n * 7;
+      out[o] = s.x; out[o + 1] = s.y;
+      out[o + 2] = s.col[0]; out[o + 3] = s.col[1]; out[o + 4] = s.col[2];
+      out[o + 5] = s.size * (0.55 + 0.45 * lifeK);
+      out[o + 6] = lifeK * 0.9;
+      n++;
       keep.push(s);
     }
     this.sparks = keep;
-    g.globalAlpha = 1;
+    return n;
   };
 
   Engine.prototype.reportFrame = function (ms) {
-    if (!R.autoQuality) return;
+    if (!PC.autoQuality) return;
     this.frameTimes.push(ms);
     if (this.frameTimes.length > 45) this.frameTimes.shift();
     if (this.frameTimes.length < 20) return;
     var sum = 0;
     for (var i = 0; i < this.frameTimes.length; i++) sum += this.frameTimes[i];
     var avg = sum / this.frameTimes.length;
-    if (avg > R.targetFrameMs) this.quality = Math.max(R.minQuality, this.quality - 0.05);
-    else if (avg < 15) this.quality = Math.min(1, this.quality + 0.02);
+    if (avg > PC.targetFrameMs) this.quality = Math.max(PC.minQuality, this.quality - 0.05);
+    else if (avg < 16) this.quality = Math.min(1, this.quality + 0.02);
   };
 
+  /* ============================================================
+   * 回退：WebGL 不可用 / 着色器编译失败 → Canvas 2D 精致版
+   * 用叠加层 canvas 绕开「同一 canvas 已绑定 webgl 就不能再取 2d」的限制。
+   * ============================================================ */
+  function makeOverlay(canvas) {
+    var ov = document.createElement('canvas');
+    ov.setAttribute('aria-hidden', 'true');
+    ov.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none;';
+    if (canvas.parentNode) canvas.parentNode.insertBefore(ov, canvas.nextSibling);
+    return Y.Bloom2D.create(ov);
+  }
+
   Y.Bloom = {
-    create: function (canvas) { return new Engine(canvas); },
-    rgba: rgba
+    create: function (canvas, overrides) {
+      try {
+        if (!canvas || !canvas.getContext) throw new Error('canvas 不可用');
+        var opts = {
+          alpha: false, antialias: false, depth: false, stencil: false,
+          premultipliedAlpha: false, preserveDrawingBuffer: false,
+          powerPreference: 'high-performance'
+        };
+        /* 仅离线截图验证会传 overrides（如 preserveDrawingBuffer:true），
+         * 让 headless 截图能稳定抓到缓冲内容；线上调用不传，行为不变。 */
+        if (overrides) {
+          for (var ok in overrides) {
+            if (Object.prototype.hasOwnProperty.call(overrides, ok)) opts[ok] = overrides[ok];
+          }
+        }
+        var gl = canvas.getContext('webgl', opts) || canvas.getContext('experimental-webgl', opts);
+        if (!gl) throw new Error('浏览器未提供 WebGL 上下文');
+        var eng = new Engine(canvas, gl);
+        eng._init();
+        if (!eng.ok) throw new Error('着色器初始化失败');
+        /* 烘焙 4.7 万粒子约 100 ms；用户还在开始页读说明，提前烘好，
+         * 点「开始」时就能直接画，不会在淡入动画里卡一下。 */
+        setTimeout(function () { try { eng._bakeNow(); } catch (e) {} }, 700);
+        return eng;
+      } catch (err) {
+        if (global.console && console.warn) {
+          console.warn('[yshnb/bloom] WebGL 不可用，回退 2D 粒子层：', (err && err.message) || err);
+        }
+        if (Y.Bloom2D) return makeOverlay(canvas);
+        throw err;
+      }
+    },
+    /* 供离线校验使用（不影响运行） */
+    __bake: bake,
+    __shaders: { bg: VS_BG + '\n' + FS_BG, pt: VS_PT + '\n' + FS_PT, sp: VS_SP + '\n' + FS_SP },
+    __units: {
+      bg: { vs: VS_BG, fs: FS_BG },
+      pt: { vs: VS_PT, fs: FS_PT },
+      sp: { vs: VS_SP, fs: FS_SP }
+    },
+    __params: PC
   };
 })(window);
