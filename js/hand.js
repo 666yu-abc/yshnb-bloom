@@ -275,9 +275,24 @@
 
   /* AbortController 超时会真正中止请求，不像旧 withTimeout 只拒绝外层
    * Promise、把底层 fetch 留在后台继续占带宽。 */
-  function fetchBuffer(url, timeoutMs, onBytes) {
+  function fetchBuffer(url, timeoutMs, onBytes, cancelSignal) {
     var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
     var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, timeoutMs) : null;
+    var onCancel = null;
+    /* 竞速输掉的源会被外部 abort；把外部信号接到内部 controller 上 */
+    if (ctrl && cancelSignal) {
+      if (cancelSignal.aborted) ctrl.abort();
+      else {
+        onCancel = function () { try { ctrl.abort(); } catch (e) {} };
+        cancelSignal.addEventListener('abort', onCancel);
+      }
+    }
+    function cleanup() {
+      if (timer) clearTimeout(timer);
+      if (onCancel && cancelSignal && cancelSignal.removeEventListener) {
+        try { cancelSignal.removeEventListener('abort', onCancel); } catch (e) {}
+      }
+    }
     var opts = { credentials: 'same-origin' };
     if (ctrl) opts.signal = ctrl.signal;
     return fetch(url, opts).then(function (r) {
@@ -311,11 +326,11 @@
         pump();
       });
     }).then(function (buf) {
-      if (timer) clearTimeout(timer);
+      cleanup();
       return buf;
     }, function (e) {
-      if (timer) clearTimeout(timer);
-      if (e && e.name === 'AbortError') e = new Error('下载超时：' + url.split('/').pop());
+      cleanup();
+      if (e && e.name === 'AbortError') e = new Error('下载超时/取消：' + url.split('/').pop());
       throw e;
     });
   }
@@ -326,12 +341,104 @@
     return new global.Response(stream).arrayBuffer();
   }
 
+  /* ---------- 多源竞速 ----------
+   * 同一资源同时从多个镜像发起下载，谁先完整下完用谁，其余立即 abort。
+   * 真机实测：GitHub Pages 15~20KB/s（9.9MB 要 10 分钟，必超时），
+   * jsDelivr gh 代理 140~260KB/s。并发先到先得，自动挑出当前网络下
+   * 最快的源，也避免慢源一直占着带宽拖到超时。 */
+  function hostOf(u) {
+    try { return new URL(u, document.baseURI).host; } catch (e) { return String(u); }
+  }
+  function fetchRace(urls, timeoutMs, onBytes, label) {
+    var list = (urls && urls.length) ? urls : null;
+    if (!list) return Promise.reject(new Error(label + ' 无可用下载地址'));
+    if (list.length === 1) return fetchBuffer(list[0], timeoutMs, onBytes);
+    return new Promise(function (resolve, reject) {
+      var settled = false, remaining = list.length, lastErr = null, ctrls = [];
+      var best = 0, bestTotal = 0;
+      /* 多个源并发上报进度会互相打架，取最大值保证进度条单调不倒退 */
+      function report(r, t) {
+        if (r > best) best = r;
+        if (t && t > bestTotal) bestTotal = t;
+        if (onBytes) onBytes(best, bestTotal);
+      }
+      list.forEach(function (u, i) {
+        var c = (typeof AbortController === 'function') ? new AbortController() : null;
+        ctrls.push(c);
+        fetchBuffer(u, timeoutMs, report, c ? c.signal : null).then(function (buf) {
+          if (settled) return;
+          settled = true;
+          for (var j = 0; j < ctrls.length; j++) {
+            if (j !== i && ctrls[j]) { try { ctrls[j].abort(); } catch (e) {} }
+          }
+          log(TAG, label + ' 竞速命中 ' + hostOf(u) +
+              ' (' + (buf.byteLength / 1048576).toFixed(2) + ' MB)');
+          resolve(buf);
+        }, function (e) {
+          lastErr = e;
+          remaining--;
+          if (remaining <= 0 && !settled) {
+            settled = true;
+            reject(lastErr || new Error(label + ' 全部下载源失败'));
+          }
+        });
+      });
+    });
+  }
+
+  /* ---------- 本地持久化缓存（Cache Storage） ----------
+   * 第一次成功后把【解压后的最终资源】写进浏览器缓存；之后每次打开
+   * 直接命中，完全不联网、秒开。key 带版本号，资源更新时自动失效。
+   * 任何一步不支持/失败都静默降级为纯下载，不影响主流程。 */
+  var CACHE_NAME = 'yshnb-vision-' + (V.cacheVersion || 'v1');
+  function cacheKey(name) {
+    try { return new URL('./__visioncache__/' + name, document.baseURI).href; }
+    catch (e) { return './__visioncache__/' + name; }
+  }
+  function cacheGet(name) {
+    if (!V.cacheEnabled || !global.caches) return Promise.resolve(null);
+    return global.caches.open(CACHE_NAME).then(function (c) {
+      return c.match(cacheKey(name));
+    }).then(function (r) {
+      return r ? r.arrayBuffer() : null;
+    }).catch(function () { return null; });
+  }
+  function cachePut(name, buf) {
+    if (!V.cacheEnabled || !global.caches || !global.Response) return Promise.resolve();
+    try {
+      /* 返回 Promise：首次加载会等它写完，保证第二次打开必定命中 */
+      return global.caches.open(CACHE_NAME).then(function (c) {
+        return c.put(cacheKey(name), new global.Response(buf, {
+          headers: { 'Content-Type': 'application/octet-stream' }
+        }));
+      }).catch(function () {});
+    } catch (e) { return Promise.resolve(); }
+  }
+
   /* 单个资源：gzip 优先，任何环节失败都回退原始文件。
    * magic 是目标文件头（wasm = 00 61 73 6d，task = 50 4b 'PK'），
    * 用于识别「CDN 已自动解压」的情况：此时 body 已是原文，不能再 gunzip。 */
-  function fetchAsset(gzUrl, rawUrl, timeoutMs, onBytes, label, magic) {
-    if (canGunzip() && gzUrl) {
-      return fetchBuffer(gzUrl, timeoutMs, onBytes).then(function (buf) {
+  /* 单个资源：先查本地缓存 → 未命中再 gzip 竞速（失败回退原始文件竞速），
+   * 成功后异步写回缓存。gzUrls / rawUrls 现在是【URL 数组】。 */
+  function fetchAsset(gzUrls, rawUrls, timeoutMs, onBytes, label, magic, estBytes) {
+    var name = label + '.bin';
+    return cacheGet(name).then(function (cached) {
+      if (cached && cached.byteLength) {
+        log(TAG, label + ' 命中本地缓存 ' + cached.byteLength + ' B（免下载）');
+        if (onBytes) onBytes(estBytes || cached.byteLength, estBytes || cached.byteLength);
+        return cached;
+      }
+      return downloadAsset(gzUrls, rawUrls, timeoutMs, onBytes, label, magic)
+        .then(function (buf) {
+          return cachePut(name, buf).then(function () { return buf; },
+                                         function () { return buf; });
+        });
+    });
+  }
+
+  function downloadAsset(gzUrls, rawUrls, timeoutMs, onBytes, label, magic) {
+    if (canGunzip() && gzUrls && gzUrls.length) {
+      return fetchRace(gzUrls, timeoutMs, onBytes, label).then(function (buf) {
         var h = new Uint8Array(buf, 0, Math.min(16, buf.byteLength));
         var isGz = h[0] === 0x1f && h[1] === 0x8b;
         /* .task 文件在 PK 头前可能带前缀，故在文件头内搜索签名而非硬比前 4 字节 */
@@ -350,10 +457,10 @@
         throw new Error('响应既非 gzip 也非目标文件');
       }).catch(function (e) {
         warn(TAG, label + ' gzip 路径不可用，回退原始文件：', e && e.message);
-        return fetchBuffer(rawUrl, timeoutMs, onBytes);
+        return fetchRace(rawUrls, timeoutMs, onBytes, label);
       });
     }
-    return fetchBuffer(rawUrl, timeoutMs, onBytes);
+    return fetchRace(rawUrls, timeoutMs, onBytes, label);
   }
 
   function prepareAssets() {
@@ -382,10 +489,10 @@
       };
     }
     return Promise.all([
-      fetchAsset(V.wasmGzPath, V.wasmBinaryPath, V.downloadTimeoutMs, emit(0), 'wasm',
-                 [0x00, 0x61, 0x73, 0x6d]),
-      fetchAsset(V.modelGzPath, V.modelPath, V.downloadTimeoutMs, emit(1), 'model',
-                 [0x50, 0x4b, 0x03, 0x04])
+      fetchAsset(V.wasmGzUrls || [V.wasmGzPath], V.wasmRawUrls || [V.wasmBinaryPath],
+                 V.downloadTimeoutMs, emit(0), 'wasm', [0x00, 0x61, 0x73, 0x6d], V.wasmGzBytes),
+      fetchAsset(V.modelGzUrls || [V.modelGzPath], V.modelRawUrls || [V.modelPath],
+                 V.downloadTimeoutMs, emit(1), 'model', [0x50, 0x4b, 0x03, 0x04], V.modelGzBytes)
     ]).then(function (arr) {
       var wasmBuf = arr[0], modelBuf = arr[1];
       /* blob URL 让 glue 的 locateFile 命中内存，初始化阶段不再发网络请求 */
@@ -451,8 +558,26 @@
     });
   }
 
+  /* ESM 入口：动态 import 无法中止，改为多源并发、先成功先用。
+   * bundle 只有 156KB，正常 <2s；多源是为了本站也慢时能借 CDN 提速。 */
+  function importBundle() {
+    var urls = (V.bundleUrls && V.bundleUrls.length) ? V.bundleUrls : [V.bundleUrl];
+    return new Promise(function (resolve, reject) {
+      var remaining = urls.length, lastErr = null, done = false;
+      urls.forEach(function (u) {
+        import(u).then(function (mod) {
+          if (!done) { done = true; resolve(mod); }
+        }, function (e) {
+          lastErr = e;
+          remaining--;
+          if (remaining <= 0 && !done) reject(lastErr || new Error('ESM 模块不可用'));
+        });
+      });
+    });
+  }
+
   function doLoad() {
-    return withTimeout(import(V.bundleUrl), 30000, 'ESM 模块').then(function (mod) {
+    return withTimeout(importBundle(), 30000, 'ESM 模块').then(function (mod) {
       if (!mod || !mod.FilesetResolver || !mod.HandLandmarker) {
         throw new Error('ESM 模块导出异常（FilesetResolver / HandLandmarker 缺失）');
       }

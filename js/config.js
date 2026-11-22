@@ -14,6 +14,30 @@
     catch (e) { return p; }
   }
 
+  /* ---------- 资源镜像：解决「手势模型加载不出来」 ----------
+   * 真机实测（1440×900，国内网络）：GitHub Pages 只有 15~20 KB/s，
+   * 两个 gzip 共 9.9 MB 要下 10 分钟，必然撞上 180s 硬超时。
+   * jsDelivr 的 gh 代理实测 140~260 KB/s（快 10~20 倍），CORS = *。
+   *
+   * 用【固定 commit SHA】锁定仓库快照：CDN 引用的是那一刻的文件，
+   * 永久稳定，不会因为后续 push / 改名而失效；vendor 里的模型与 wasm
+   * 本就是不变的大文件，正好适合固定引用。
+   *
+   * mirrors() 把「仓库内相对路径」展开成多个候选 URL，最后一个是本站
+   * 相对地址（兜底）。运行时由 hand.js 并发竞速，谁先下完用谁。 */
+  var SNAPSHOT = 'fa535c4cef37552f2ec20bdda97cb888510f6a14';
+  var CDN_BASES = [
+    'https://gcore.jsdelivr.net/gh/666yu-abc/yshnb-bloom@' + SNAPSHOT + '/',
+    'https://fastly.jsdelivr.net/gh/666yu-abc/yshnb-bloom@' + SNAPSHOT + '/',
+    'https://cdn.jsdelivr.net/gh/666yu-abc/yshnb-bloom@' + SNAPSHOT + '/'
+  ];
+  function mirrors(rel) {
+    var out = [];
+    for (var i = 0; i < CDN_BASES.length; i++) out.push(CDN_BASES[i] + rel);
+    out.push(abs('./' + rel));
+    return out;
+  }
+
   var CFG = {
     /* ---------- 花朵几何：三层花轮，外层先开、内层后开 ----------
      * 每片花瓣 = 平滑贝塞尔轮廓 + 根→尖渐变瓣面 + 三层瓣缘描边
@@ -191,18 +215,35 @@
       minHandPresenceConfidence: 0.50,
       minTrackingConfidence: 0.50,
       delegate: 'GPU',
+
+      /* 单 URL 字段保留：FilesetResolver 兜底路径、以及不支持竞速的旧浏览器
+       * 仍需要它们。日常加载改用下面的 *Urls 镜像数组，由 hand.js 并发竞速。 */
       bundleUrl: abs('./vendor/vision_bundle.mjs'),
       wasmPath: abs('./vendor/wasm'),
       modelPath: abs('./vendor/hand_landmarker.task'),
-      /* 预下载：优先取 gzip 版本（wasm 14.6→4.0 MB，模型 7.8→5.5 MB），
-       * 浏览器不支持流式解压或 gz 缺失时自动回退原始文件。
-       * 下载完成后改用内存 blob URL + modelAssetBuffer 初始化，
-       * 让 createFromOptions 阶段完全不碰网络，超时只用于本地 wasm 编译。 */
       wasmGzPath: abs('./vendor/wasm/vision_wasm_internal.wasm.gz'),
       modelGzPath: abs('./vendor/hand_landmarker.task.gz'),
       wasmLoaderPath: abs('./vendor/wasm/vision_wasm_internal.js'),
       wasmBinaryPath: abs('./vendor/wasm/vision_wasm_internal.wasm'),
-      downloadTimeoutMs: 180000,  // 单次资源下载硬超时（慢网留足）
+
+      /* ---------- 多源竞速：每个资源 = 3 个 CDN 镜像 + 本站兜底 ----------
+       * 谁先完整下完用谁，其余立即取消。国内访问 GitHub Pages 实测仅
+       * 15~20KB/s，而 jsDelivr gh 代理 140~260KB/s，提速一个数量级。 */
+      bundleUrls: mirrors('vendor/vision_bundle.mjs'),
+      wasmGzUrls: mirrors('vendor/wasm/vision_wasm_internal.wasm.gz'),
+      modelGzUrls: mirrors('vendor/hand_landmarker.task.gz'),
+      wasmRawUrls: mirrors('vendor/wasm/vision_wasm_internal.wasm'),
+      modelRawUrls: mirrors('vendor/hand_landmarker.task'),
+      /* 说明：wasm glue（336KB）仍由 MediaPipe 用本站 wasmLoaderPath 加载，
+       * 不参与竞速 —— 初始化阶段改动风险高，且它体积小，不是瓶颈。
+       * 真正的瓶颈（9.9MB 两个 gzip）已由上面的竞速 + 缓存解决。 */
+
+      /* 本地持久化缓存：第一次成功后把【解压后的】资源写进 Cache Storage，
+       * 之后每次打开直接从浏览器本地读，完全不联网、秒开。 */
+      cacheVersion: 'v2-gz',
+      cacheEnabled: true,
+
+      downloadTimeoutMs: 180000,  // 单次资源下载硬超时（多源竞速下几乎用不到）
       initTimeoutMs: 90000,       // wasm 编译 + 图初始化（纯本地，正常几秒）
       progressThrottleMs: 140,    // 进度状态刷新节流
       /* 仅供进度显示预估：两个 gzip 资源的体积（字节），让百分比从

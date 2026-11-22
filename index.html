@@ -208,11 +208,13 @@
 
   <noscript><div class="noscript">这个小站需要 JavaScript 才能运行，请在浏览器设置里开启后再打开。</div></noscript>
 
-  <!-- 依赖按「配置 → 识别 → 状态机 → 渲染 → 装配」顺序加载 -->
-  <script src="js/config.js"></script>
-  <script src="js/hand.js"></script>
-  <script src="js/gestures.js"></script>
-  <script src="js/bloom.js"></script>
-  <script src="js/main.js"></script>
+  <!-- 依赖按「配置 → 识别 → 状态机 → 渲染 → 装配」顺序加载
+       统一版本号：本次改动 config.js / hand.js（多 CDN 竞速 + 本地缓存），
+       换戳可让浏览器立即拉取新脚本，不受 Pages 的 10 分钟静态缓存影响。 -->
+  <script src="js/config.js?v=20261122h"></script>
+  <script src="js/hand.js?v=20261122h"></script>
+  <script src="js/gestures.js?v=20261122h"></script>
+  <script src="js/bloom.js?v=20261122h"></script>
+  <script src="js/main.js?v=20261122h"></script>
 </body>
 </html>
