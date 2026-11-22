@@ -4,11 +4,13 @@
  * 一朵花 = 三层「花轮」(whorl)，每层若干片参数化花瓣：
  *   · 伪 3D：花瓣以 tilt 角斜立，open 时摊平、closed 时竖起包成花苞；
  *     花平面按 flatten 压成椭圆，形成斜俯视的立体感。
- *   · 每片花瓣 = 瓣缘高光描边 + 侧脉 + 稀疏填充微粒 + 极低透明度瓣面。
+ *   · 每片花瓣 = 平滑贝塞尔轮廓 + 根到尖渐变瓣面 + 三层瓣缘描边
+ *     + 主脉 / 侧脉 / 瓣尖高光 + 稀疏填充微粒。
  *   · 花心 = 黄金角颗粒 + 辐射雄蕊细丝 + 柔光晕。
  *   · 分层开放：外层 lag=0 先舒展，内层 lag>0 后跟，张手时依次绽开。
  *   · 弹簧-阻尼跟随目标位形；降质时按 rank 砍填充点，永远保住轮廓。
- * 黑底用 lighter 叠加，月光白 / 香槟金 / 冷青，发光但不糊。
+ * 黑底用 lighter 叠加，樱花粉 / 蜜桃粉 / 粉白，发光但不糊。
+ * 轮廓质感由矢量层保证（不随性能降质），粒子层只负责闪烁细节。
  * ============================================================ */
 (function (global) {
   'use strict';
@@ -26,8 +28,8 @@
   var CORE_I = WH.length * PER;   // 花心 sprite 下标
   var SPARK_I = CORE_I + 1;       // 火花
   var GLINT_I = CORE_I + 2;       // 纯白高光
-  var HALO_I = CORE_I + 3;        // 暖白柔光（瓣心 / 花心大晕）
-  var MOTE_I = CORE_I + 4;        // 冷白光粒（环境浮游）
+  var HALO_I = CORE_I + 3;        // 粉白柔光（瓣心 / 花心大晕）
+  var MOTE_I = CORE_I + 4;        // 粉白光粒（环境浮游）
 
   function lerp(a, b, t) { return a + (b - a) * t; }
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
@@ -83,8 +85,8 @@
     arr.push(makeSprite(C.core));
     arr.push(makeSprite(C.spark));
     arr.push(makeSprite('#FFFFFF'));
-    arr.push(makeSprite('#FFF3D8'));   // HALO_I
-    arr.push(makeSprite('#E8F4FF'));   // MOTE_I
+    arr.push(makeSprite('#FFE6F2'));   // HALO_I：粉白柔光
+    arr.push(makeSprite('#FFEFF7'));   // MOTE_I：粉白光粒
     return arr;
   }
 
@@ -99,9 +101,12 @@
     var curl = lerp(wh.curlClosed, wh.curlOpen, oe);
     var tilt = lerp(wh.tiltClosed, wh.tiltOpen, oe);
 
-    /* 纺锤形轮廓：瓣根收、中段宽、瓣尖收；叠一层极细的瓣缘波浪 */
+    /* 纺锤形轮廓：瓣根收、中段宽、瓣尖收；
+     * 主浪 + 高频细浪叠加，做出真花瓣那种不完全规整的柔顺瓣缘。 */
     var prof = Math.pow(Math.sin(Math.PI * clamp(u, 0, 1)), wh.profilePow);
-    var halfW = wid * len * prof * (1 + F.ripple * Math.sin(u * Math.PI * 3 + p * 1.7));
+    var wave = F.ripple * Math.sin(u * Math.PI * 3 + p * 1.7)
+             + (F.ripple2 || 0) * Math.sin(u * Math.PI * 9 + p * 2.9 + (wh.rot || 0) * 11);
+    var halfW = wid * len * prof * (1 + wave);
     var tang = v * halfW;
 
     var ang = ((p + (wh.phase || 0)) / count) * TAU + (wh.rot || 0)
@@ -337,7 +342,7 @@
     }
   };
 
-  /* 极淡银线茎与叶：暗底上只留一线微光，不抢花 */
+  /* 极淡粉灰线茎与叶：暗底上只留一线微光，不抢花 */
   Engine.prototype.drawStem = function (x, y, o) {
     if (!F.drawStem) return;
     var g = this.ctx;
@@ -423,14 +428,50 @@
     g.globalAlpha = 1;
   };
 
-  /* 花瓣面 + 瓣缘高光：给粒子层垫一层「纱」，花才有实体而非散点 */
+  /* 用「中点 + 二次贝塞尔」把采样点连成连续光滑曲线。
+   * 旧版是 10 段 lineTo 直接勾勒，放大后折线感明显、瓣缘粗陋；
+   * 这里让曲线经过每个采样点的邻接中点，得到柔顺的 C1 连续瓣缘。 */
+  function traceSmooth(g, pts) {
+    var n = pts.length;
+    if (n < 3) {
+      for (var q = 0; q < n; q++) {
+        if (q === 0) g.moveTo(pts[q].x, pts[q].y);
+        else g.lineTo(pts[q].x, pts[q].y);
+      }
+      return;
+    }
+    g.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i < n - 1; i++) {
+      var mx = (pts[i].x + pts[i + 1].x) * 0.5;
+      var my = (pts[i].y + pts[i + 1].y) * 0.5;
+      g.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+    }
+    var last = pts[n - 1];
+    g.quadraticCurveTo(last.x, last.y, last.x, last.y);
+  }
+
+  /* 采样一条瓣缘（v 固定，u: 0→1），返回屏幕坐标点列 */
+  Engine.prototype._edgePoints = function (wh, count, p, v, o, sway, sc, flower, SEG) {
+    var tmp = this._tmp, pts = [];
+    for (var i = 0; i <= SEG; i++) {
+      petalPoint(wh, count, p, i / SEG, v, o, sway, tmp);
+      pts.push({ x: flower.x + tmp.x * sc, y: flower.y + tmp.y * sc });
+    }
+    return pts;
+  };
+
+  /* 花瓣面 + 瓣缘：给粒子层垫一层「纱」，花才有实体而非散点。
+   * 轮廓、渐变、描边都是矢量绘制，不随性能降质，永远保住精致度。 */
   Engine.prototype.drawPetals = function (flower, now, alpha, isBud) {
     if (isBud || flower.openness < 0.035) return;
     var g = this.ctx, o = flower.openness, sc = flower.scale;
     var sway = F.swayAmp * Math.sin(now * F.swaySpeed + flower.seed);
     var tmp = this._tmp;
-    var SEG = 10;
+    var SEG = F.petalSeg || 26;
     g.globalCompositeOperation = 'lighter';
+    g.lineJoin = 'round';
+    g.lineCap = 'round';
+
     for (var w = 0; w < WH.length; w++) {
       var wh = WH[w], count = wh.count;
       /* 该层的有效开放度决定面与描边的可见度 */
@@ -439,29 +480,87 @@
       for (var p = 0; p < count; p++) {
         /* 瓣心柔光：让每片花瓣自己透亮，而非只有边缘亮 */
         petalPoint(wh, count, p, 0.55, 0, o, sway, tmp);
-        var hs = wh.lenOpen * L.haloScale * oe * sc;
-        var hx = flower.x + tmp.x * sc * 0.72;
-        var hy = flower.y + tmp.y * sc * 0.72;
+        var halo = wh.lenOpen * L.haloScale * oe * sc;
         g.globalAlpha = L.haloAlpha * oe * alpha;
-        g.drawImage(this.pal[HALO_I], hx - hs / 2, hy - hs / 2, hs, hs);
+        g.drawImage(this.pal[HALO_I],
+          flower.x + tmp.x * sc * 0.72 - halo / 2,
+          flower.y + tmp.y * sc * 0.72 - halo / 2, halo, halo);
         g.globalAlpha = 1;
 
+        /* 根点 / 尖点：给瓣面与主脉的渐变定方向 */
+        petalPoint(wh, count, p, 0.02, 0, o, sway, tmp);
+        var rx = flower.x + tmp.x * sc, ry = flower.y + tmp.y * sc;
+        petalPoint(wh, count, p, 0.98, 0, o, sway, tmp);
+        var tx = flower.x + tmp.x * sc, ty = flower.y + tmp.y * sc;
+
+        /* 闭合轮廓：左缘 0→1、右缘 1→0，贝塞尔连成光滑曲线 */
+        var left = this._edgePoints(wh, count, p, -1, o, sway, sc, flower, SEG);
+        var right = this._edgePoints(wh, count, p, 1, o, sway, sc, flower, SEG);
+        var ring = left.concat(right.slice().reverse());
         g.beginPath();
-        for (var i = 0; i <= SEG; i++) {
-          petalPoint(wh, count, p, i / SEG, -1, o, sway, tmp);
-          var x = flower.x + tmp.x * sc, y = flower.y + tmp.y * sc;
-          if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
-        }
-        for (var j = SEG; j >= 0; j--) {
-          petalPoint(wh, count, p, j / SEG, 1, o, sway, tmp);
-          g.lineTo(flower.x + tmp.x * sc, flower.y + tmp.y * sc);
+        traceSmooth(g, ring);
+        g.closePath();
+
+        /* 瓣面：根深尖透的线性渐变，薄纱透光 */
+        var grd = g.createLinearGradient(rx, ry, tx, ty);
+        grd.addColorStop(0, rgba(wh.root, F.faceAlpha * oe * alpha));
+        grd.addColorStop(0.42, rgba(wh.glow, F.faceAlpha * 0.72 * oe * alpha));
+        grd.addColorStop(1, rgba(wh.tip, F.faceTipAlpha * oe * alpha));
+        g.fillStyle = grd;
+        g.fill();
+
+        /* 三层瓣缘：柔光宽边 → 亮边，勾出轮廓与体积 */
+        g.strokeStyle = rgba(wh.glow, F.edgeSoftAlpha * oe * alpha);
+        g.lineWidth = 2.0;
+        g.stroke();
+        g.strokeStyle = rgba(wh.tip, F.edgeLineAlpha * oe * alpha);
+        g.lineWidth = 0.7;
+        g.stroke();
+
+        /* 内缩细线：沿花心方向收 3.5%，做出瓣缘翻卷的厚度 */
+        g.beginPath();
+        for (var ii = 0; ii < ring.length; ii++) {
+          var ip = ring[ii];
+          var ix = flower.x + (ip.x - flower.x) * 0.965;
+          var iy = flower.y + (ip.y - flower.y) * 0.965;
+          if (ii === 0) g.moveTo(ix, iy); else g.lineTo(ix, iy);
         }
         g.closePath();
-        g.fillStyle = rgba(wh.glow, F.faceAlpha * oe * alpha);
-        g.fill();
-        g.strokeStyle = rgba(wh.glow, F.edgeLineAlpha * oe * alpha);
+        g.strokeStyle = rgba(wh.glow, F.edgeInnerAlpha * oe * alpha);
+        g.lineWidth = 0.55;
+        g.stroke();
+
+        /* 主脉：根→尖渐隐的细线，给花瓣一条挺立的中脊 */
+        var mid = this._edgePoints(wh, count, p, 0, o, sway, sc, flower, SEG);
+        g.beginPath();
+        traceSmooth(g, mid);
+        var mg = g.createLinearGradient(rx, ry, tx, ty);
+        mg.addColorStop(0, rgba(wh.root, F.midribAlpha * oe * alpha));
+        mg.addColorStop(0.7, rgba(wh.glow, F.midribAlpha * 0.45 * oe * alpha));
+        mg.addColorStop(1, rgba(wh.tip, 0));
+        g.strokeStyle = mg;
         g.lineWidth = 0.6;
         g.stroke();
+
+        /* 侧脉：两条从瓣根发散到瓣缘的极淡弧线 */
+        for (var vd = -1; vd <= 1; vd += 2) {
+          g.beginPath();
+          for (var si = 0; si <= 8; si++) {
+            var su = si / 8;
+            petalPoint(wh, count, p, 0.04 + su * 0.86, vd * (0.20 + su * 0.62), o, sway, tmp);
+            var sx = flower.x + tmp.x * sc, sy = flower.y + tmp.y * sc;
+            if (si === 0) g.moveTo(sx, sy); else g.lineTo(sx, sy);
+          }
+          g.strokeStyle = rgba(wh.glow, F.veinLineAlpha * oe * alpha);
+          g.lineWidth = 0.5;
+          g.stroke();
+        }
+
+        /* 瓣尖高光：极小的亮点，像停在瓣尖的露珠 */
+        g.globalAlpha = F.tipGlintAlpha * oe * alpha;
+        var tg = 2.6 * sc;
+        g.drawImage(this.pal[GLINT_I], tx - tg, ty - tg, tg * 2, tg * 2);
+        g.globalAlpha = 1;
       }
     }
   };

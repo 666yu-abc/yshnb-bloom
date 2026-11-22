@@ -1,6 +1,6 @@
 /* ============================================================
  * yshnb · 指尖生花 — Nocturne
- * 深墨底 / 编辑式网格 / 发丝细线 / 香槟金点缀
+ * 深墨底 / 编辑式网格 / 发丝细线 / 淡玫瑰粉点缀
  * ============================================================ */
 
 :root {
@@ -10,8 +10,8 @@
   --ink-soft:  #B7B2A8;
   --ink-dim:   #76746F;
   --ink-faint: #46474B;
-  --gold:      #C9A97A;
-  --gold-dim:  rgba(201, 169, 122, .42);
+  --rose:      #DCAAC4;
+  --rose-dim:  rgba(220, 170, 196, .42);
   --line:      rgba(237, 232, 222, .10);
   --line-2:    rgba(237, 232, 222, .20);
   --serif: "Songti SC", "STSong", "Noto Serif CJK SC", "Source Han Serif SC", Georgia, "Times New Roman", serif;
@@ -32,7 +32,7 @@ body {
 body.in-stage { overflow: hidden; }
 button { font-family: inherit; color: inherit; cursor: pointer; }
 [hidden] { display: none !important; }
-::selection { background: rgba(201, 169, 122, .28); color: #fff; }
+::selection { background: rgba(220, 170, 196, .28); color: #fff; }
 
 /* ---------- 背景：颗粒 / 极淡渐晕 / 竖向网格 ---------- */
 .grain {
@@ -43,8 +43,8 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 .aura {
   position: fixed; inset: 0; z-index: 0; pointer-events: none;
   background:
-    radial-gradient(ellipse 58% 52% at 64% 38%, rgba(201, 169, 122, .052), transparent 72%),
-    radial-gradient(ellipse 85% 75% at 42% 72%, rgba(58, 72, 94, .10), transparent 76%);
+    radial-gradient(ellipse 58% 52% at 64% 38%, rgba(220, 170, 196, .052), transparent 72%),
+    radial-gradient(ellipse 85% 75% at 42% 72%, rgba(94, 62, 84, .10), transparent 76%);
 }
 .grid-lines {
   position: fixed; inset: 0; z-index: 0; pointer-events: none;
@@ -79,12 +79,12 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   display: flex; align-items: center; gap: 13px;
   font-family: var(--mono); font-size: 13px; letter-spacing: .34em; color: var(--ink);
 }
-.brand-mark { width: 20px; height: 20px; color: var(--gold); }
+.brand-mark { width: 20px; height: 20px; color: var(--rose); }
 .mast-meta {
   display: flex; align-items: center; gap: 14px;
   font-family: var(--mono); font-size: 10px; letter-spacing: .3em; color: var(--ink-dim);
 }
-.mast-meta .sep { color: var(--gold-dim); }
+.mast-meta .sep { color: var(--rose-dim); }
 .mast-year {
   justify-self: end; font-family: var(--mono);
   font-size: 10px; letter-spacing: .3em; color: var(--ink-dim);
@@ -100,7 +100,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 .hero > :not(.hero-figure) { position: relative; z-index: 1; }
 .hero-kicker {
   font-family: var(--mono); font-size: 10px; letter-spacing: .34em;
-  color: var(--gold); margin: 0 0 clamp(26px, 4vh, 46px);
+  color: var(--rose); margin: 0 0 clamp(26px, 4vh, 46px);
 }
 .hero-title {
   font-family: var(--serif); font-weight: 400;
@@ -120,7 +120,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 }
 .hero-rule i {
   position: absolute; left: 0; top: -1px;
-  width: clamp(64px, 8vw, 124px); height: 2px; background: var(--gold);
+  width: clamp(64px, 8vw, 124px); height: 2px; background: var(--rose);
 }
 .hero-lede {
   font-family: var(--serif); font-size: clamp(14px, 1.15vw, 17px);
@@ -141,7 +141,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   font-size: 12px; letter-spacing: .3em; color: var(--ink);
 }
 .index-no {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .28em; color: var(--gold);
+  font-family: var(--mono); font-size: 10px; letter-spacing: .28em; color: var(--rose);
 }
 .index-list { list-style: none; margin: 0; padding: 0; }
 .index-item {
@@ -150,11 +150,11 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   transition: background .5s var(--ease), padding-left .5s var(--ease);
 }
 .index-item:hover {
-  background: linear-gradient(90deg, rgba(201, 169, 122, .055), transparent 72%);
+  background: linear-gradient(90deg, rgba(220, 170, 196, .055), transparent 72%);
   padding-left: 14px;
 }
 .index-item .no {
-  font-family: var(--mono); font-size: 11px; letter-spacing: .1em; color: var(--gold);
+  font-family: var(--mono); font-size: 11px; letter-spacing: .1em; color: var(--rose);
 }
 .index-item .zh {
   font-family: var(--serif); font-size: clamp(22px, 2vw, 30px);
@@ -165,7 +165,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   font-size: 10px; letter-spacing: .3em; color: var(--ink-dim);
   transition: color .5s;
 }
-.index-item:hover .en { color: var(--gold); }
+.index-item:hover .en { color: var(--rose); }
 .index-item .desc {
   grid-column: 2; grid-row: 2; margin-top: 8px;
   font-size: 11px; letter-spacing: .16em; color: var(--ink-dim);
@@ -185,7 +185,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   display: flex; align-items: center; gap: 12px;
   font-size: 11px; letter-spacing: .08em; color: var(--ink-dim);
 }
-.privacy svg { color: var(--gold); flex: none; }
+.privacy svg { color: var(--rose); flex: none; }
 .privacy strong { color: var(--ink-soft); font-weight: 400; }
 .actions { display: flex; align-items: center; gap: 32px; justify-self: end; }
 .btn-enter {
@@ -195,9 +195,9 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   transition: border-color .5s, background .5s;
 }
 .btn-enter .arrow {
-  font-size: 16px; color: var(--gold); transition: transform .5s var(--ease);
+  font-size: 16px; color: var(--rose); transition: transform .5s var(--ease);
 }
-.btn-enter:hover { border-color: var(--gold-dim); background: rgba(201, 169, 122, .06); }
+.btn-enter:hover { border-color: var(--rose-dim); background: rgba(220, 170, 196, .06); }
 .btn-enter:hover .arrow { transform: translateX(6px); }
 .btn-alt {
   border: 0; background: none; color: var(--ink-dim);
@@ -205,7 +205,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   border-bottom: 1px solid var(--line-2); padding: 6px 0;
   transition: color .4s, border-color .4s;
 }
-.btn-alt:hover { color: var(--ink); border-color: var(--gold); }
+.btn-alt:hover { color: var(--ink); border-color: var(--rose); }
 .load-note {
   grid-column: 1 / -1; font-family: var(--mono); font-size: 10px;
   letter-spacing: .14em; color: var(--ink-faint); margin: 6px 0 0;
@@ -223,7 +223,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 #canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 
 .stage-frame { position: absolute; inset: clamp(18px, 2.5vw, 36px); pointer-events: none; }
-.stage-frame i { position: absolute; width: 17px; height: 17px; border: 0 solid var(--gold-dim); }
+.stage-frame i { position: absolute; width: 17px; height: 17px; border: 0 solid var(--rose-dim); }
 .stage-frame .tl { top: 0; left: 0; border-top-width: 1px; border-left-width: 1px; }
 .stage-frame .tr { top: 0; right: 0; border-top-width: 1px; border-right-width: 1px; }
 .stage-frame .bl { bottom: 0; left: 0; border-bottom-width: 1px; border-left-width: 1px; }
@@ -237,7 +237,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   background: linear-gradient(180deg, rgba(10, 11, 14, .74), transparent);
 }
 .stage-brand { font-family: var(--mono); font-size: 11px; letter-spacing: .3em; color: var(--ink); }
-.stage-brand span { color: var(--gold); margin: 0 8px; }
+.stage-brand span { color: var(--rose); margin: 0 8px; }
 .stage-center { font-family: var(--mono); font-size: 10px; letter-spacing: .32em; color: var(--ink-dim); }
 .stage-tools { justify-self: end; display: flex; gap: 26px; }
 .tool {
@@ -246,7 +246,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   border-bottom: 1px solid transparent;
   transition: color .4s, border-color .4s;
 }
-.tool:hover { color: var(--ink); border-color: var(--gold-dim); }
+.tool:hover { color: var(--ink); border-color: var(--rose-dim); }
 
 .hud-label {
   position: absolute; top: 21%; left: 50%;
@@ -254,7 +254,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   font-family: var(--serif); font-size: clamp(34px, 5vw, 72px);
   letter-spacing: .34em; color: var(--ink);
   opacity: 0; pointer-events: none;
-  text-shadow: 0 0 44px rgba(201, 169, 122, .28);
+  text-shadow: 0 0 44px rgba(220, 170, 196, .28);
   transition: opacity .6s var(--ease), transform .6s var(--ease);
 }
 .hud-label.show { opacity: .94; transform: translate(-50%, 0); }
@@ -269,7 +269,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   padding-bottom: 14px; border-bottom: 1px solid var(--line-2);
 }
 .hud-head em { font-style: normal; margin-left: auto; color: var(--ink-faint); font-size: 9px; }
-.hud-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 10px var(--gold); }
+.hud-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--rose); box-shadow: 0 0 10px var(--rose); }
 .hud-row {
   display: flex; justify-content: space-between; align-items: baseline;
   padding: 10px 0; border-bottom: 1px solid var(--line);
@@ -277,7 +277,7 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 .hud-key { font-size: 10px; letter-spacing: .2em; color: var(--ink-dim); }
 .hud-val { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; color: var(--ink); }
 .hud-bar-track { height: 1px; background: var(--line); margin: 16px 0 14px; }
-.hud-bar { height: 1px; width: 0; background: var(--gold); box-shadow: 0 0 8px var(--gold-dim); transition: width .2s linear; }
+.hud-bar { height: 1px; width: 0; background: var(--rose); box-shadow: 0 0 8px var(--rose-dim); transition: width .2s linear; }
 .hud-hint { font-size: 10px; line-height: 2; letter-spacing: .1em; color: var(--ink-faint); margin-top: 14px; }
 
 .cam-wrap {
@@ -289,15 +289,20 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 .cam-wrap.is-hidden { opacity: 0; transform: translateY(10px); pointer-events: none; }
 #video {
   position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
-  transform: scaleX(-1); filter: grayscale(1) contrast(1.14) brightness(.74); opacity: .88;
+  transform: scaleX(-1);
+  /* 调用原相机彩色画面，只压低饱和度并略提亮：
+   * 纯黑白太像监控、看不清手；100% 全彩又会成为画面里唯一高饱和的
+   * 动态区域，抢走花的注意力。低饱和柔化兼顾真实感与整体克制，
+   * 叠加的玫瑰粉骨架线在柔化底上也更清楚。 */
+  filter: saturate(.48) contrast(1.03) brightness(.9); opacity: .9;
 }
 #skeleton { position: absolute; inset: 0; width: 100%; height: 100%; }
 .cam-tag {
   position: absolute; left: 8px; bottom: 7px;
-  font-family: var(--mono); font-size: 9px; letter-spacing: .18em; color: var(--gold);
+  font-family: var(--mono); font-size: 9px; letter-spacing: .18em; color: var(--rose);
   background: rgba(10, 11, 14, .74); padding: 3px 8px;
 }
-.cam-corner { position: absolute; width: 9px; height: 9px; border: 0 solid var(--gold-dim); }
+.cam-corner { position: absolute; width: 9px; height: 9px; border: 0 solid var(--rose-dim); }
 .cam-corner.tl { top: 3px; left: 3px; border-top-width: 1px; border-left-width: 1px; }
 .cam-corner.tr { top: 3px; right: 3px; border-top-width: 1px; border-right-width: 1px; }
 .cam-corner.bl { bottom: 3px; left: 3px; border-bottom-width: 1px; border-left-width: 1px; }
@@ -309,8 +314,12 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   font-family: var(--mono); font-size: 10px; letter-spacing: .2em; color: var(--ink-dim);
   transition: color .5s;
 }
-.status[data-tone="ok"]   { color: var(--gold); }
+.status[data-tone="ok"]   { color: var(--rose); }
 .status[data-tone="warn"] { color: #D9A07A; }
+
+/* 只去掉随手势弹出的大字字幕（绽放 / 指尖生花 / 一阵风）。
+ * 页面其余文字（实时状态面板、底部状态栏、顶栏、摄像头标签）全部保留。 */
+.hud-label { display: none !important; }
 
 /* ============================================================
  *  提示弹层
@@ -325,10 +334,10 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 }
 .notice-card::before {
   content: ""; position: absolute; top: -1px; left: -1px;
-  width: 18px; height: 18px; border-top: 1px solid var(--gold); border-left: 1px solid var(--gold);
+  width: 18px; height: 18px; border-top: 1px solid var(--rose); border-left: 1px solid var(--rose);
 }
-.notice-mark { width: 34px; height: 34px; color: var(--gold); }
-.notice-cap { font-family: var(--mono); font-size: 9px; letter-spacing: .3em; color: var(--gold); margin: 24px 0 0; }
+.notice-mark { width: 34px; height: 34px; color: var(--rose); }
+.notice-cap { font-family: var(--mono); font-size: 9px; letter-spacing: .3em; color: var(--rose); margin: 24px 0 0; }
 .notice-card p {
   font-family: var(--serif); font-size: 14px; line-height: 2.1; letter-spacing: .05em;
   color: var(--ink-soft); margin: 14px 0 30px;

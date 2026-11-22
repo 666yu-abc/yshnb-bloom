@@ -17,6 +17,8 @@
   var PIPS = [3, 6, 10, 14, 18];
   var FOUR_TIPS = [8, 12, 16, 20];
   var FOUR_PIPS = [6, 10, 14, 18];
+  var OTHER_TIPS = [12, 16, 20];
+  var OTHER_PIPS = [10, 14, 18];
 
   var state = {
     mode: 'idle',              // idle | camera | pointer
@@ -26,7 +28,7 @@
     prevLandmarks: [],         // 上一帧平滑后的关键点，用于 EMA
     prevCenters: [],
     prevOpenness: [],          // 按手索引分别平滑，避免两只手互相污染
-    rawWindows: [],            // 按手索引的张开度观测窗口（自适应标定）
+    calib: [],                 // 按手索引的长期张开度标定 {lo, hi, lastAt}
     lastSeenAt: 0,
     lastTs: -1,
     onStatus: function () {},
@@ -91,41 +93,61 @@
     inter /= 4;
 
     var raw = G.spreadWeight * spread + G.interWeight * inter;
-    /* 自适应标定：取最近约 2.5 秒观测值的 min/max 做动态拉伸。
-     * 手型大小、离镜头远近因人而异，固定阈值无法兼顾；只要做过一次
-     * 握拳→张手，窗口即覆盖完整量程，openness 自然铺满 0~1。
-     * 窗口按手索引分开，双手时互不污染。 */
-    var win = state.rawWindows[index] || (state.rawWindows[index] = []);
-    win.push(raw);
-    if (win.length > G.rawWindowFrames) win.shift();
-    var lo, hi;
-    if (win.length >= 20) {
-      var mn = Infinity, mx = -Infinity;
-      for (var qi = 0; qi < win.length; qi++) {
-        if (win[qi] < mn) mn = win[qi];
-        if (win[qi] > mx) mx = win[qi];
-      }
-      var span = Math.max(G.adaptSpanMin, mx - mn);
-      var mid = (mn + mx) * 0.5;
-      lo = mid - span * 0.5;
-      hi = mid + span * 0.5;
-    } else {
-      lo = G.openMin; hi = G.openMax;
-    }
-    var rawOpen = clamp((raw - lo) / (hi - lo), 0, 1);
-    var prevO = state.prevOpenness[index] || 0;
-    var openness = prevO + (rawOpen - prevO) * G.opennessEma;
-    state.prevOpenness[index] = openness;
 
-    /* 卷曲计数：指尖比近节更靠近腕，说明这根手指弯了 */
+    /* ---- 张开度标定：长期极值 + 极慢回归 ----
+     * 旧版取最近 150 帧的 min/max：长时间保持握拳时，窗口里的张手高值
+     * 会全部过期，span 被 adaptSpanMin 撑住、mid 却掉到握拳值，握拳便被
+     * 误算成中等张开度，噪声一抖就「自动绽放」。现在新极值立即吸收
+     * （自适应手型 / 远近），其余时候按 26 秒时间常数极慢收敛，静态
+     * 保持一个姿势几秒不会让标定坍缩。按手索引分开，双手互不污染。 */
+    var cal = state.calib[index] || (state.calib[index] = {
+      lo: G.openMin, hi: G.openMax, lastAt: now
+    });
+    var dt = clamp(now - cal.lastAt, 0, 120);
+    cal.lastAt = now;
+    if (raw < cal.lo) cal.lo = raw;
+    if (raw > cal.hi) cal.hi = raw;
+    var k = 1 - Math.exp(-dt / G.calibForgetMs);
+    cal.lo += (raw - cal.lo) * k * 0.5;
+    cal.hi += (raw - cal.hi) * k * 0.5;
+    if (cal.hi - cal.lo < G.adaptSpanMin) {
+      var cm = (cal.hi + cal.lo) * 0.5;
+      cal.lo = cm - G.adaptSpanMin * 0.5;
+      cal.hi = cm + G.adaptSpanMin * 0.5;
+    }
+    var rawOpen = clamp((raw - cal.lo) / (cal.hi - cal.lo), 0, 1);
+    /* 低位死区：把底部一小段压成 0，握拳时的微小抖动不会放大成张开 */
+    rawOpen = clamp((rawOpen - G.deadZone) / (1 - G.deadZone), 0, 1);
+
+    /* ---- 卷曲计数：指尖比近节更靠近腕，说明这根手指弯了 ----
+     * 这是几何硬事实，不受标定漂移影响。 */
     var curled = 0;
     for (var j = 0; j < FOUR_TIPS.length; j++) {
       if (dist(l[FOUR_TIPS[j]], l[0]) < dist(l[FOUR_PIPS[j]], l[0]) * 1.02) curled++;
     }
-    var isFist = curled >= 3 && openness < G.fistThreshold;
+    var isFist = curled >= G.fistCurlMin;
+    /* 双保险：明确握拳时强制张开度归零，无论标定怎么漂都不绽放 */
+    if (isFist) rawOpen = 0;
 
+    var prevO = state.prevOpenness[index] || 0;
+    var openness = prevO + (rawOpen - prevO) * G.opennessEma;
+    state.prevOpenness[index] = openness;
+
+    /* ---- 捏合 ----
+     * 握拳时拇指与食指也靠得很近，只看指尖距离会把每次握拳都当成捏合
+     * （乱生小花，且 pinchActive 卡住导致真捏合反而不响应）。因此要求
+     * ①拇指-食指尖足够近 ②中/无名/小指至少 2 根伸展 ③手整体张开度
+     * 超过门槛，三者同时成立才算有效捏合。 */
     var pinchRaw = dist(l[4], l[8]) / s;
-    var pinch = clamp((pinchRaw - 0.15) / 1.1, 0, 1);
+    var pinchClose = clamp((G.pinchRefDist - pinchRaw) / (G.pinchRefDist * 0.85), 0, 1);
+    var otherExt = 0;
+    for (var e = 0; e < 3; e++) {
+      if (dist(l[OTHER_TIPS[e]], l[0]) > dist(l[OTHER_PIPS[e]], l[0]) * 1.12) otherExt++;
+    }
+    var pinchEligible = !isFist &&
+      otherExt >= G.pinchOtherExtend &&
+      openness > G.pinchMinOpen;
+    var pinch = pinchEligible ? pinchClose : 0;
 
     /* 自拍镜像：video 显示时水平翻转，故 x 取 1-x 才与画面一致 */
     var cx = (1 - (l[0].x + l[9].x) / 2) * W;
@@ -155,6 +177,8 @@
       isFist: isFist,
       pinch: pinch,
       pinchRaw: pinchRaw,
+      pinchClose: pinchClose,
+      pinchEligible: pinchEligible,
       velocity: velocity
     };
   }
@@ -270,7 +294,7 @@
     state.prevOpenness.length = 0;
     state.prevLandmarks.length = 0;
     state.prevCenters.length = 0;
-    state.rawWindows.length = 0;
+    state.calib.length = 0;
   }
 
   /* ---------- 鼠标 / 触摸降级 ---------- */
@@ -334,7 +358,8 @@
       frame.hands = [{
         index: 0, center: { x: p.px, y: p.py }, tip: { x: p.px, y: p.py },
         landmarks: [], palmScale: 1, openness: openness, isFist: held,
-        pinch: 0, pinchRaw: 1, velocity: { x: 0, y: 0 }
+        pinch: 0, pinchRaw: 1, pinchClose: 0, pinchEligible: false,
+        velocity: { x: 0, y: 0 }
       }];
       state.lastSeenAt = now;
       if (p.upAt && !p.down) {

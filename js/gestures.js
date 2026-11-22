@@ -2,7 +2,8 @@
  * 手势 → 语义状态机
  * 把连续的 openness / pinch / velocity 变成「绽放、闭合、脉冲、
  * 新生花苞、风」等事件，并输出每帧的花朵描述子供渲染层消费。
- * 关键设计：所有阈值都带滞回或冷却，避免指尖轻微抖动导致闪烁。
+ * 关键设计：所有阈值都带滞回或冷却，避免指尖轻微抖动导致闪烁；
+ * 盛放与捏合都需要「持续确认」，单帧尖峰不会误触发事件。
  * ============================================================ */
 (function (global) {
   'use strict';
@@ -16,6 +17,7 @@
     return {
       state: 'BUD',
       lowSince: 0, lowDuration: 0,
+      bloomSince: 0, pinchSince: 0,
       lastPulseAt: -1e9, lastPinchAt: -1e9, lastSwipeAt: -1e9,
       pinchActive: false,
       x: 0.5, y: 0.5,                // 平滑后的花心（归一化）
@@ -51,7 +53,7 @@
     var out = {
       openness: 0, state: 'IDLE', handCount: 0,
       flowers: [], buds: [], pointer: null, events: [],
-      label: this.lastEvent
+      label: ''
     };
     var rawHands = frame.hands || [];
     out.handCount = rawHands.length;
@@ -62,14 +64,15 @@
       var hand = rawHands[i];
 
       if (!hand) {
-        /* 手丢了：缓缓闭合，不瞬间消失 */
+        /* 手丢了：缓缓闭合，不瞬间消失；同时复位捏合，回来可重新触发 */
         hs.openness = Math.max(0, hs.openness - G.idleCloseSpeed * 16);
         if (hs.openness < G.fistThreshold) hs.state = 'BUD';
+        hs.bloomSince = 0; hs.pinchSince = 0;
+        hs.pinchActive = false;
         continue;
       }
 
       var o = hand.openness;
-      var prevO = hs.openness;
       hs.openness = o;
 
       /* 花心跟随掌心，做一次位置平滑，跟手但不抖 */
@@ -77,13 +80,17 @@
       if (!hs.hasCenter) { hs.x = nx; hs.y = ny; hs.hasCenter = true; }
       else { hs.x += (nx - hs.x) * 0.16; hs.y += (ny - hs.y) * 0.16; }
 
-      /* 状态机（滞回） */
+      /* 状态机（滞回 + 盛放时间确认：单帧尖峰不会误判盛放） */
       if (hs.state === 'BLOOM') {
-        if (o < G.bloomThreshold - G.hysteresis) hs.state = 'CLOSING';
+        if (o < G.bloomThreshold - G.hysteresis) {
+          hs.state = 'CLOSING'; hs.bloomSince = 0;
+        }
+      } else if (o > G.bloomThreshold + G.hysteresis) {
+        if (!hs.bloomSince) hs.bloomSince = now;
+        hs.state = (now - hs.bloomSince >= G.bloomConfirmMs) ? 'BLOOM' : 'OPENING';
       } else {
-        if (o > G.bloomThreshold + G.hysteresis) hs.state = 'BLOOM';
-        else if (o > G.fistThreshold + G.hysteresis) hs.state = 'OPENING';
-        else hs.state = 'BUD';
+        hs.bloomSince = 0;
+        hs.state = (o > G.fistThreshold + G.hysteresis) ? 'OPENING' : 'BUD';
       }
 
       /* 记录「低位停留」，用于识别「握紧 → 猛地张开」 */
@@ -101,16 +108,26 @@
         hs.lowSince = 0; hs.lowDuration = 0;
       }
 
-      /* 捏合 → 指尖生出一朵新花苞 */
-      if (!hs.pinchActive && hand.pinchRaw < G.pinchOn &&
-          (now - hs.lastPinchAt) > G.pinchCooldownMs) {
-        hs.pinchActive = true;
-        hs.lastPinchAt = now;
-        this._spawnBud(hand.tip.x / W, hand.tip.y / H, now);
-        out.events.push({ type: 'newbud', x: hand.tip.x, y: hand.tip.y, hand: i });
-        this._label('指尖生花', now);
-      } else if (hs.pinchActive && hand.pinchRaw > G.pinchOff) {
-        hs.pinchActive = false;
+      /* 捏合 → 指尖生出一朵新花苞。
+       * pinchEligible / pinchClose 由识别层给出，已排除握拳姿态；
+       * 这里再要求持续 pinchHoldMs，避免快握快放的瞬时误触。 */
+      var pc = hand.pinchClose || 0;
+      var eligible = !!hand.pinchEligible;
+      if (!hs.pinchActive && eligible && pc > G.pinchOn) {
+        if (!hs.pinchSince) hs.pinchSince = now;
+        if ((now - hs.pinchSince) >= G.pinchHoldMs &&
+            (now - hs.lastPinchAt) > G.pinchCooldownMs) {
+          hs.pinchActive = true;
+          hs.lastPinchAt = now;
+          hs.pinchSince = 0;
+          this._spawnBud(hand.tip.x / W, hand.tip.y / H, now);
+          out.events.push({ type: 'newbud', x: hand.tip.x, y: hand.tip.y, hand: i });
+          this._label('指尖生花', now);
+        }
+      } else {
+        hs.pinchSince = 0;
+        /* 松开（或不再满足捏合姿态）才复位，下一次捏合才能重新触发 */
+        if (hs.pinchActive && (!eligible || pc < G.pinchOff)) hs.pinchActive = false;
       }
 
       /* 快速挥手 → 一阵风 */
@@ -176,7 +193,9 @@
     this.buds = keep;
 
     if (frame.pointer) out.pointer = frame.pointer;
-    out.label = (now - this.lastEventAt < 1600) ? this.lastEvent : '';
+    /* 沉浸模式：不再向画面输出「绽放 / 指尖生花 / 一阵风」这类手势字幕。
+     * 事件与状态机照常运行，只是不把文字贴到花上。 */
+    out.label = '';
     return out;
   };
 

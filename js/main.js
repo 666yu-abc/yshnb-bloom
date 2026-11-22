@@ -143,8 +143,6 @@
     el['hud-bar'].style.width = (desc.openness * 100).toFixed(1) + '%';
     el['hud-hands'].textContent = desc.handCount + ' / 2';
     el['hud-fps'].textContent = fps + ' fps';
-    el['hud-label'].textContent = desc.label || '';
-    el['hud-label'].classList.toggle('show', !!desc.label);
   }
 
   /* ---------- 事件 ---------- */
