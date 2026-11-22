@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://666yu-abc.github.io/yshnb-bloom/sitemap.xml

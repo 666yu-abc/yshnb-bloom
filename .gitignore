@@ -1,0 +1,6 @@
+# 开发文档 / 平台元数据不进入公开仓库
+*.md
+*.genie
+.workbuddy/
+.DS_Store
+_tools/

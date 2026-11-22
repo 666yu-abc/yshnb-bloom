@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0A0B0E">
+  <title>yshnb · 指尖生花 / Nocturne</title>
+  <meta name="description" content="把手放在镜头前，张开花就开，握拢花便合。用手势控制一朵精致粒子花的绽放与闭合，画面只在本机运算。">
+  <link rel="canonical" href="https://666yu-abc.github.io/yshnb-bloom/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="yshnb · 指尖生花 / Nocturne">
+  <meta property="og:description" content="张开花就开，握拢花便合。用手势控制一朵粒子花的绽放与闭合。">
+  <meta property="og:url" content="https://666yu-abc.github.io/yshnb-bloom/">
+  <meta property="og:site_name" content="yshnb">
+  <meta name="author" content="yshnb">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="style.css">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"WebApplication","name":"yshnb · 指尖生花 / Nocturne",
+   "url":"https://666yu-abc.github.io/yshnb-bloom/","applicationCategory":"EntertainmentApplication",
+   "description":"用手势控制粒子花朵绽放与闭合的交互式网页，摄像头画面仅在本机处理。",
+   "author":{"@type":"Person","name":"yshnb"},"browserRequirements":"需要支持 WebAssembly、Canvas 2D 与 getUserMedia 的现代浏览器"}
+  </script>
+</head>
+<body>
+
+  <!-- ===== 背景层：颗粒 / 渐晕 / 竖向发丝网格 ===== -->
+  <div class="grain" aria-hidden="true"></div>
+  <div class="aura" aria-hidden="true"></div>
+  <div class="grid-lines" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+
+  <!-- 精致玫瑰线稿：开始页水印 / 弹层标记 / 品牌标 复用 -->
+  <svg class="defs" aria-hidden="true" width="0" height="0">
+    <defs>
+      <path id="p-out" d="M120 120 C 90 90, 94 34, 120 14 C 146 34, 150 90, 120 120 Z"/>
+      <path id="p-mid" d="M120 120 C 100 98, 102 56, 120 40 C 138 56, 140 98, 120 120 Z"/>
+      <path id="p-in"  d="M120 120 C 108 106, 110 78, 120 66 C 130 78, 132 106, 120 120 Z"/>
+      <symbol id="rose" viewBox="0 0 240 240">
+        <g fill="none" stroke="currentColor" stroke-width="1.05" stroke-linejoin="round">
+          <use href="#p-out" transform="rotate(0 120 120)"/>
+          <use href="#p-out" transform="rotate(45 120 120)"/>
+          <use href="#p-out" transform="rotate(90 120 120)"/>
+          <use href="#p-out" transform="rotate(135 120 120)"/>
+          <use href="#p-out" transform="rotate(180 120 120)"/>
+          <use href="#p-out" transform="rotate(225 120 120)"/>
+          <use href="#p-out" transform="rotate(270 120 120)"/>
+          <use href="#p-out" transform="rotate(315 120 120)"/>
+          <use href="#p-mid" transform="rotate(25.7 120 120)"/>
+          <use href="#p-mid" transform="rotate(77.1 120 120)"/>
+          <use href="#p-mid" transform="rotate(128.6 120 120)"/>
+          <use href="#p-mid" transform="rotate(180 120 120)"/>
+          <use href="#p-mid" transform="rotate(231.4 120 120)"/>
+          <use href="#p-mid" transform="rotate(282.9 120 120)"/>
+          <use href="#p-mid" transform="rotate(334.3 120 120)"/>
+          <use href="#p-in" transform="rotate(0 120 120)"/>
+          <use href="#p-in" transform="rotate(72 120 120)"/>
+          <use href="#p-in" transform="rotate(144 120 120)"/>
+          <use href="#p-in" transform="rotate(216 120 120)"/>
+          <use href="#p-in" transform="rotate(288 120 120)"/>
+          <circle cx="120" cy="120" r="12"/>
+          <circle cx="120" cy="120" r="4" fill="currentColor" stroke="none"/>
+        </g>
+      </symbol>
+      <symbol id="petal" viewBox="0 0 40 40">
+        <path d="M20 4 C31 12 34 24 20 36 C6 24 9 12 20 4 Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="brandmark" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round">
+          <path d="M12 2 L15.4 8.6 L22 12 L15.4 15.4 L12 22 L8.6 15.4 L2 12 L8.6 8.6 Z"/>
+          <circle cx="12" cy="12" r="2.1" fill="currentColor" stroke="none"/>
+        </g>
+      </symbol>
+    </defs>
+  </svg>
+
+  <!-- ================= 开始页 ================= -->
+  <main id="landing" class="landing">
+
+    <header class="masthead">
+      <div class="brand">
+        <svg class="brand-mark" aria-hidden="true"><use href="#brandmark"/></svg>
+        <span>yshnb</span>
+      </div>
+      <div class="mast-meta">AN INTERACTIVE STUDY <span class="sep">/</span> No. 002</div>
+      <div class="mast-year">MMXXVI</div>
+    </header>
+
+    <div class="landing-body">
+      <div class="hero">
+        <svg class="hero-figure" aria-hidden="true"><use href="#rose"/></svg>
+
+        <p class="hero-kicker">NO. 002 &nbsp;—&nbsp; GESTURE · PARTICLE · BLOOM</p>
+        <h1 class="hero-title"><span class="line">指尖</span><span class="line">生花</span></h1>
+        <p class="hero-en">BLOOM AT YOUR FINGERTIPS</p>
+        <div class="hero-rule"><i></i></div>
+        <p class="hero-lede">
+          把手放在镜头前。张开，花瓣便一层层舒展；握拢，它轻轻收成一枚花苞。<br>
+          不必触碰什么，只消动一动手指，光就在你指间聚成一朵花。<br>
+          三层花轮、脉络与雄蕊，随呼吸微微起伏——像真的，正在开。
+        </p>
+      </div>
+
+      <div class="index">
+        <div class="index-head"><span>手势索引 / GESTURES</span><span class="index-no">01 — 04</span></div>
+        <ul class="index-list">
+          <li class="index-item">
+            <span class="no">01</span>
+            <span class="zh">握拳</span>
+            <span class="en">FIST</span>
+            <span class="desc">花瓣收拢，敛成一枚花苞</span>
+          </li>
+          <li class="index-item">
+            <span class="no">02</span>
+            <span class="zh">张手</span>
+            <span class="en">OPEN</span>
+            <span class="desc">三层花轮，由外而内依次盛放</span>
+          </li>
+          <li class="index-item">
+            <span class="no">03</span>
+            <span class="zh">捏合</span>
+            <span class="en">PINCH</span>
+            <span class="desc">指尖新生一朵，长大、开、静静淡去</span>
+          </li>
+          <li class="index-item">
+            <span class="no">04</span>
+            <span class="zh">快握快放</span>
+            <span class="en">PULSE</span>
+            <span class="desc">一瞬迸发，光粒向四周散开</span>
+          </li>
+        </ul>
+        <p class="index-note">另有：快速挥手起一阵风 · 双手各控一朵。手离开镜头时，花不会消失，只会缓缓合上等你回来。</p>
+      </div>
+    </div>
+
+    <footer class="landing-foot">
+      <div class="privacy">
+        <svg viewBox="0 0 24 24" aria-hidden="true" width="16" height="16">
+          <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4.5" y="10.5" width="15" height="10" rx="2.4"/>
+            <path d="M8 10.5 V7.5 a4 4 0 0 1 8 0 v3"/>
+            <circle cx="12" cy="15.5" r="1.1" fill="currentColor" stroke="none"/>
+          </g>
+        </svg>
+        <span>摄像头画面<strong>只在本机运算</strong>，不上传、不录制、不留存；随时可以关掉。</span>
+      </div>
+      <div class="actions">
+        <button id="btn-start" class="btn-enter" type="button">开启摄像头，开始 <span class="arrow">→</span></button>
+        <button id="btn-pointer" class="btn-alt" type="button">不用摄像头，用鼠标体验</button>
+      </div>
+      <p id="load-note" class="load-note">首次会加载约 8 MB 手势模型 · 建议 Chrome / Edge / Safari · 摄像头需 https 或 localhost</p>
+    </footer>
+  </main>
+
+  <!-- ================= 体验页 ================= -->
+  <section id="stage" class="stage" aria-label="指尖生花体验画布">
+    <canvas id="canvas"></canvas>
+
+    <div class="stage-frame" aria-hidden="true">
+      <i class="tl"></i><i class="tr"></i><i class="bl"></i><i class="br"></i>
+    </div>
+
+    <div class="stage-top">
+      <div class="stage-brand">yshnb <span>/</span> NOCTURNE</div>
+      <div class="stage-center">手势 · 实时演算</div>
+      <div class="stage-tools">
+        <button id="btn-back" class="tool" type="button">← 回到开始</button>
+        <button id="btn-cam" class="tool" type="button">隐藏画面</button>
+        <button id="btn-reset" class="tool" type="button">重置</button>
+        <button id="btn-full" class="tool" type="button">全屏</button>
+      </div>
+    </div>
+
+    <div id="hud-label" class="hud-label"></div>
+
+    <aside class="hud" aria-label="实时状态">
+      <div class="hud-head"><span class="hud-dot"></span> 实时状态 <em>LIVE</em></div>
+      <div class="hud-row"><span class="hud-key">输入</span><span id="hud-mode" class="hud-val">—</span></div>
+      <div class="hud-row"><span class="hud-key">花态</span><span id="hud-state" class="hud-val">静候</span></div>
+      <div class="hud-row"><span class="hud-key">张开度</span><span id="hud-open" class="hud-val">0%</span></div>
+      <div class="hud-bar-track"><div id="hud-bar" class="hud-bar"></div></div>
+      <div class="hud-row"><span class="hud-key">追踪手势</span><span id="hud-hands" class="hud-val">0 / 2</span></div>
+      <div class="hud-row"><span class="hud-key">帧率</span><span id="hud-fps" class="hud-val">— fps</span></div>
+      <p class="hud-hint">握拳收 · 张手放 · 捏合生新花 · 挥手起风<br>双击落花雨 · R 重置 · M 切鼠标 · Esc 返回</p>
+    </aside>
+
+    <div id="cam-wrap" class="cam-wrap">
+      <video id="video" playsinline muted autoplay></video>
+      <canvas id="skeleton" width="160" height="120"></canvas>
+      <span class="cam-tag">本机预览</span>
+      <i class="cam-corner tl"></i><i class="cam-corner tr"></i><i class="cam-corner bl"></i><i class="cam-corner br"></i>
+    </div>
+
+    <div id="status" class="status" data-tone="info"></div>
+  </section>
+
+  <!-- ================= 提示弹层 ================= -->
+  <div id="notice" class="notice" hidden>
+    <div class="notice-card" role="dialog" aria-modal="true" aria-labelledby="notice-text">
+      <svg class="notice-mark" viewBox="0 0 40 40" aria-hidden="true"><use href="#petal"/></svg>
+      <p class="notice-cap">NOTICE / 提示</p>
+      <p id="notice-text"></p>
+      <button id="notice-btn" class="btn-enter" type="button">知道了</button>
+    </div>
+  </div>
+
+  <noscript><div class="noscript">这个小站需要 JavaScript 才能运行，请在浏览器设置里开启后再打开。</div></noscript>
+
+  <!-- 依赖按「配置 → 识别 → 状态机 → 渲染 → 装配」顺序加载 -->
+  <script src="js/config.js"></script>
+  <script src="js/hand.js"></script>
+  <script src="js/gestures.js"></script>
+  <script src="js/bloom.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
