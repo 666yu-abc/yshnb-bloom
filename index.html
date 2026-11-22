@@ -14,12 +14,12 @@
   <meta property="og:site_name" content="yshnb">
   <meta name="author" content="yshnb">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
-  <link rel="stylesheet" href="style.css?v=20261122g">
+  <link rel="stylesheet" href="style.css">
   <script type="application/ld+json">
   {"@context":"https://schema.org","@type":"WebApplication","name":"yshnb · 指尖生花 / Nocturne",
    "url":"https://666yu-abc.github.io/yshnb-bloom/","applicationCategory":"EntertainmentApplication",
    "description":"用手势控制粒子花朵绽放与闭合的交互式网页，摄像头画面仅在本机处理。",
-   "author":{"@type":"Person","name":"yshnb"},"browserRequirements":"需要支持 WebAssembly、WebGL 与 getUserMedia 的现代浏览器"}
+   "author":{"@type":"Person","name":"yshnb"},"browserRequirements":"需要支持 WebAssembly、Canvas 2D 与 getUserMedia 的现代浏览器"}
   </script>
 </head>
 <body>
@@ -209,12 +209,10 @@
   <noscript><div class="noscript">这个小站需要 JavaScript 才能运行，请在浏览器设置里开启后再打开。</div></noscript>
 
   <!-- 依赖按「配置 → 识别 → 状态机 → 渲染 → 装配」顺序加载 -->
-  <script src="js/config.js?v=20261122g"></script>
-  <script src="js/hand.js?v=20261122g"></script>
-  <script src="js/gestures.js?v=20261122g"></script>
-  <!-- bloom2d.js 是 WebGL 不可用时的精致 2D 回退层，必须先于 bloom.js 加载 -->
-  <script src="js/bloom2d.js?v=20261122g"></script>
-  <script src="js/bloom.js?v=20261122g"></script>
-  <script src="js/main.js?v=20261122g"></script>
+  <script src="js/config.js"></script>
+  <script src="js/hand.js"></script>
+  <script src="js/gestures.js"></script>
+  <script src="js/bloom.js"></script>
+  <script src="js/main.js"></script>
 </body>
 </html>
