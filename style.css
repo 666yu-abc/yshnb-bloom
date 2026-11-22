@@ -333,7 +333,10 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   font-family: var(--serif); font-size: 14px; line-height: 2.1; letter-spacing: .05em;
   color: var(--ink-soft); margin: 14px 0 30px;
 }
-.notice-card .btn-enter { width: 100%; justify-content: space-between; }
+.notice-actions { display: grid; gap: 10px; }
+.notice-actions .btn-enter { width: 100%; justify-content: space-between; }
+.notice-actions .btn-alt { width: 100%; }
+.notice-actions [hidden] { display: none !important; }
 .noscript {
   position: fixed; inset: 0; z-index: 30; display: grid; place-items: center;
   background: var(--bg); color: var(--ink); font-size: 14px; letter-spacing: .1em;

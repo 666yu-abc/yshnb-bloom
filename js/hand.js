@@ -26,6 +26,7 @@
     prevLandmarks: [],         // 上一帧平滑后的关键点，用于 EMA
     prevCenters: [],
     prevOpenness: [],          // 按手索引分别平滑，避免两只手互相污染
+    rawWindows: [],            // 按手索引的张开度观测窗口（自适应标定）
     lastSeenAt: 0,
     lastTs: -1,
     onStatus: function () {},
@@ -90,7 +91,28 @@
     inter /= 4;
 
     var raw = G.spreadWeight * spread + G.interWeight * inter;
-    var rawOpen = clamp((raw - G.openMin) / (G.openMax - G.openMin), 0, 1);
+    /* 自适应标定：取最近约 2.5 秒观测值的 min/max 做动态拉伸。
+     * 手型大小、离镜头远近因人而异，固定阈值无法兼顾；只要做过一次
+     * 握拳→张手，窗口即覆盖完整量程，openness 自然铺满 0~1。
+     * 窗口按手索引分开，双手时互不污染。 */
+    var win = state.rawWindows[index] || (state.rawWindows[index] = []);
+    win.push(raw);
+    if (win.length > G.rawWindowFrames) win.shift();
+    var lo, hi;
+    if (win.length >= 20) {
+      var mn = Infinity, mx = -Infinity;
+      for (var qi = 0; qi < win.length; qi++) {
+        if (win[qi] < mn) mn = win[qi];
+        if (win[qi] > mx) mx = win[qi];
+      }
+      var span = Math.max(G.adaptSpanMin, mx - mn);
+      var mid = (mn + mx) * 0.5;
+      lo = mid - span * 0.5;
+      hi = mid + span * 0.5;
+    } else {
+      lo = G.openMin; hi = G.openMax;
+    }
+    var rawOpen = clamp((raw - lo) / (hi - lo), 0, 1);
     var prevO = state.prevOpenness[index] || 0;
     var openness = prevO + (rawOpen - prevO) * G.opennessEma;
     state.prevOpenness[index] = openness;
@@ -177,25 +199,63 @@
     });
   }
 
+  var TAG = '[yshnb/vision]';
+
+  function log() {
+    if (global.console && console.info) console.info.apply(console, arguments);
+  }
+  function withTimeout(promise, ms, label) {
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var timer = setTimeout(function () {
+        if (!done) reject(new Error(label + ' 超时（>' + Math.round(ms / 1000) + 's）'));
+      }, ms);
+      promise.then(function (v) { done = true; clearTimeout(timer); resolve(v); },
+                   function (e) { done = true; clearTimeout(timer); reject(e); });
+    });
+  }
+
   function loadLandmarker() {
-    /* 动态 import 本地 ESM bundle；不依赖任何外部 CDN */
-    return import(V.bundleUrl).then(function (mod) {
-      var FilesetResolver = mod.FilesetResolver;
-      var HandLandmarker = mod.HandLandmarker;
-      return FilesetResolver.forVisionTasks(V.wasmPath).then(function (fileset) {
+    /* 动态 import 本地 ESM bundle；不依赖任何外部 CDN。
+     * 每一步单独包超时并打日志，任何一环失败都能在控制台看到确切原因，
+     * 错误信息也会回传到界面提示，而不是笼统的「网络或路径问题」。 */
+    return withTimeout(import(V.bundleUrl), 20000, 'ESM 模块').then(function (mod) {
+      if (!mod || !mod.FilesetResolver || !mod.HandLandmarker) {
+        throw new Error('ESM 模块导出异常（FilesetResolver / HandLandmarker 缺失）');
+      }
+      log(TAG, 'bundle 已加载');
+      return withTimeout(
+        mod.FilesetResolver.forVisionTasks(V.wasmPath), 20000, 'wasm 路径解析'
+      ).then(function (fileset) {
         function build(delegate) {
-          return HandLandmarker.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: V.modelPath, delegate: delegate },
-            runningMode: 'VIDEO',
-            numHands: V.numHands,
-            minHandDetectionConfidence: V.minHandDetectionConfidence,
-            minHandPresenceConfidence: V.minHandPresenceConfidence,
-            minTrackingConfidence: V.minTrackingConfidence
-          });
+          return withTimeout(
+            mod.HandLandmarker.createFromOptions(fileset, {
+              baseOptions: { modelAssetPath: V.modelPath, delegate: delegate },
+              runningMode: 'VIDEO',
+              numHands: V.numHands,
+              minHandDetectionConfidence: V.minHandDetectionConfidence,
+              minHandPresenceConfidence: V.minHandPresenceConfidence,
+              minTrackingConfidence: V.minTrackingConfidence
+            }), 45000, '模型初始化(' + delegate + ')'
+          );
         }
         /* 有些设备没有可用的 WebGL 后端，GPU 建不起来时自动退回 CPU 推理 */
-        return build(V.delegate).catch(function () { return build('CPU'); });
+        return build(V.delegate).catch(function (gpuErr) {
+          if (global.console && console.warn) {
+            console.warn(TAG, 'GPU 后端不可用，改用 CPU：', gpuErr && gpuErr.message);
+          }
+          return build('CPU');
+        });
+      }).then(function (lm) {
+        log(TAG, 'HandLandmarker 就绪');
+        return lm;
       });
+    }).catch(function (err) {
+      if (global.console && console.error) {
+        console.error(TAG, '加载失败：', (err && err.message) || err, err);
+        console.error(TAG, '资源路径：', V.bundleUrl, V.wasmPath, V.modelPath);
+      }
+      throw err;
     });
   }
 
@@ -210,6 +270,7 @@
     state.prevOpenness.length = 0;
     state.prevLandmarks.length = 0;
     state.prevCenters.length = 0;
+    state.rawWindows.length = 0;
   }
 
   /* ---------- 鼠标 / 触摸降级 ---------- */
@@ -245,13 +306,18 @@
         var rawHands = (res && res.landmarks) || [];
         if (rawHands.length) {
           state.lastSeenAt = now;
-          state.prevLandmarks.length = rawHands.length;
-          state.prevCenters.length = rawHands.length;
-          frame.hands = rawHands.map(function (raw, i) {
+          /* 先按镜像后的掌心 x 排序原始关键点，再分配索引：平滑状态与
+           * 花朵 id 共用同一稳定顺序，双手时不会互相污染或左右乱跳。 */
+          var ordered = rawHands.slice().sort(function (a, b) {
+            var ax = 1 - (a[0].x + a[9].x) / 2;
+            var bx = 1 - (b[0].x + b[9].x) / 2;
+            return ax - bx;
+          });
+          state.prevLandmarks.length = ordered.length;
+          state.prevCenters.length = ordered.length;
+          frame.hands = ordered.map(function (raw, i) {
             return describe(smoothLandmarks(raw, i), i, now, W, H);
           });
-          /* 按 x 排序，保证双手各控一朵花时不会左右乱跳 */
-          frame.hands.sort(function (a, b) { return a.center.x - b.center.x; });
         }
       } catch (e) {
         /* 单帧检测失败不打断主循环 */

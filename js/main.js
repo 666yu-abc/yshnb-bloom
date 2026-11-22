@@ -23,7 +23,7 @@
      'skeleton', 'cam-wrap', 'hud-mode', 'hud-state', 'hud-open', 'hud-bar',
      'hud-fps', 'hud-hands', 'hud-label', 'status', 'btn-back', 'btn-cam',
      'btn-reset', 'btn-full', 'notice', 'notice-text', 'notice-btn',
-     'load-note'].forEach(function (id) { el[id] = $(id); });
+     'notice-retry', 'load-note'].forEach(function (id) { el[id] = $(id); });
   }
 
   function setStatus(text, tone) {
@@ -32,7 +32,7 @@
     el.status.dataset.tone = tone || 'info';
   }
 
-  function showNotice(text, btnText, onClick) {
+  function showNotice(text, btnText, onClick, retryText, onRetry) {
     if (!el.notice) return;
     el['notice-text'].textContent = text;
     el['notice-btn'].textContent = btnText || '知道了';
@@ -40,6 +40,16 @@
       el.notice.hidden = true;
       if (onClick) onClick();
     };
+    if (retryText && el['notice-retry']) {
+      el['notice-retry'].textContent = retryText;
+      el['notice-retry'].hidden = false;
+      el['notice-retry'].onclick = function () {
+        el.notice.hidden = true;
+        if (onRetry) onRetry();
+      };
+    } else if (el['notice-retry']) {
+      el['notice-retry'].hidden = true;
+    }
     el.notice.hidden = false;
   }
 
@@ -214,7 +224,7 @@
     Y.Hand.init({
       onStatus: function (kind, detail) {
         var map = {
-          model: '正在唤醒手势识别…（首次约需几秒）',
+          model: '正在加载手势模型…（首次约 22 MB，请稍候）',
           ready: '摄像头已就绪 · 握拳收拢，张手绽放',
           denied: '摄像头权限被拒绝',
           nocamera: '没有找到摄像头',
@@ -222,15 +232,37 @@
           modelfailed: '手势模型未能加载',
           pointer: '鼠标模式'
         };
-        setStatus(map[kind] || detail || '', kind === 'ready' ? 'ok' : 'info');
+        /* 失败时把真实原因放进状态栏，方便一眼看到卡在哪一步 */
+        var text = (kind === 'modelfailed' && detail) ? detail : (map[kind] || detail || '');
+        if (text.length > 76) text = text.slice(0, 76) + '…';
+        setStatus(text, kind === 'ready' ? 'ok' : 'info');
         if (kind === 'denied') {
           showNotice('浏览器拒绝了摄像头访问。视频只在本机处理，不会上传或录制。你可以继续用鼠标完整体验，也可以在地址栏左侧把摄像头权限改为「允许」后刷新。', '用鼠标继续', function () {
             Y.Hand.usePointer(W, H);
           });
         } else if (kind === 'modelfailed') {
-          showNotice('手势识别模型没有加载成功，通常是网络或路径问题。已为你切换到鼠标模式，效果一样可以演示。', '用鼠标继续', function () {
-            Y.Hand.usePointer(W, H);
-          });
+          var why = String(detail || '').replace(/^手势模型加载失败：/, '');
+          showNotice(
+            '手势识别模型没有加载成功' + (why ? '：' + why : '') +
+            '。首次需下载约 22 MB 模型，可点「重试」再试一次；视频只在本机运算，也可以先用鼠标完整体验。',
+            '用鼠标继续',
+            function () { Y.Hand.usePointer(W, H); },
+            '重试摄像头',
+            function () {
+              setStatus('正在重新加载手势模型…', 'info');
+              Y.Hand.startCamera(el.video, W, H).then(function (ok) {
+                if (ok) {
+                  camVisible = true;
+                  el['cam-wrap'].classList.remove('is-hidden');
+                  el['btn-cam'].textContent = '隐藏画面';
+                  setStatus('摄像头已就绪 · 握拳收拢，张手绽放', 'ok');
+                } else {
+                  setStatus('重试未成功，已保持鼠标模式', 'warn');
+                  Y.Hand.usePointer(W, H);
+                }
+              });
+            }
+          );
         } else if (kind === 'nocamera' || kind === 'insecure') {
           showNotice('没有可用的摄像头（或当前不是 https / localhost）。已切换到鼠标模式。', '用鼠标继续', function () {
             Y.Hand.usePointer(W, H);
@@ -241,9 +273,16 @@
     bind();
     resize();
 
-    /* 停留在开始页时后台预热模型，进入体验页可直接命中缓存 */
-    if (global.fetch && V.modelPath) {
-      fetch(V.modelPath).then(function (r) { return r.arrayBuffer(); }).catch(function () {});
+    /* 停留在开始页时后台预热三大件（bundle / 模型 / wasm），
+     * 用户读说明的这几秒里就把约 22 MB 拉进 HTTP 缓存，
+     * 进入体验页时 HandLandmarker 能直接命中，不必干等。 */
+    if (global.fetch) {
+      [V.modelPath,
+       V.wasmPath + '/vision_wasm_internal.js',
+       V.wasmPath + '/vision_wasm_internal.wasm',
+       V.bundleUrl].forEach(function (u) {
+        fetch(u).then(function (r) { return r.arrayBuffer(); }).catch(function () {});
+      });
     }
   }
 

@@ -18,6 +18,7 @@
   var P = Y.CFG.physics;
   var R = Y.CFG.render;
   var C = Y.CFG.palette;
+  var L = Y.CFG.light;
   var WH = F.whorls;
   var TAU = Math.PI * 2;
   var SHADES = 5;                 // 每层花瓣从根到尖的色阶数
@@ -25,6 +26,8 @@
   var CORE_I = WH.length * PER;   // 花心 sprite 下标
   var SPARK_I = CORE_I + 1;       // 火花
   var GLINT_I = CORE_I + 2;       // 纯白高光
+  var HALO_I = CORE_I + 3;        // 暖白柔光（瓣心 / 花心大晕）
+  var MOTE_I = CORE_I + 4;        // 冷白光粒（环境浮游）
 
   function lerp(a, b, t) { return a + (b - a) * t; }
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
@@ -61,8 +64,9 @@
     var g = cv.getContext('2d');
     var grd = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
     grd.addColorStop(0, rgba(hex, 1));
-    grd.addColorStop(0.20, rgba(hex, 0.80));
-    grd.addColorStop(0.52, rgba(hex, 0.20));
+    grd.addColorStop(0.14, rgba(hex, 0.94));
+    grd.addColorStop(0.38, rgba(hex, 0.42));
+    grd.addColorStop(0.72, rgba(hex, 0.09));
     grd.addColorStop(1, rgba(hex, 0));
     g.fillStyle = grd;
     g.fillRect(0, 0, s, s);
@@ -79,6 +83,8 @@
     arr.push(makeSprite(C.core));
     arr.push(makeSprite(C.spark));
     arr.push(makeSprite('#FFFFFF'));
+    arr.push(makeSprite('#FFF3D8'));   // HALO_I
+    arr.push(makeSprite('#E8F4FF'));   // MOTE_I
     return arr;
   }
 
@@ -215,6 +221,31 @@
         len: 0.58 + rnd() * 0.42
       });
     }
+    /* 环境光粒：绕花缓慢浮游的细碎亮点，各自有轨道、相位与色温 */
+    this.motes = [];
+    var outer = WH[0].radiusOpen * L.moteRadius;
+    for (i = 0; i < L.motesPerFlower; i++) {
+      var ma = rnd() * TAU;
+      var mr = Math.sqrt(rnd()) * outer;
+      var pick = rnd();
+      this.motes.push({
+        a: ma, r: mr, drift: (rnd() - 0.5) * 2,
+        ph: rnd() * TAU, bob: 0.6 + rnd() * 0.9,
+        size: L.moteSizeMin + rnd() * (L.moteSizeMax - L.moteSizeMin),
+        ci: pick < 0.42 ? MOTE_I : (pick < 0.70 ? GLINT_I : (pick < 0.87 ? CORE_I : SHADES))
+      });
+    }
+    /* 星芒：稀疏纯白十字，闪现即隐，制造细碎高光 */
+    this.glints = [];
+    for (i = 0; i < L.glintsPerFlower; i++) {
+      var ga = rnd() * TAU;
+      var gr = (0.18 + rnd() * 0.92) * WH[0].radiusOpen;
+      this.glints.push({
+        x: Math.cos(ga) * gr, y: Math.sin(ga) * gr * F.flatten,
+        ph: rnd() * TAU, len: 0.55 + rnd() * 0.85,
+        ci: rnd() > 0.4 ? GLINT_I : HALO_I
+      });
+    }
     this.count = pts.length;
   };
 
@@ -281,7 +312,7 @@
         x: x, y: y, px: x, py: y,
         vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 0.5,
         born: performance.now(), size: 2.4 + Math.random() * 4.2,
-        color: idx
+        color: Math.random() < 0.22 ? GLINT_I : idx
       });
     }
   };
@@ -333,7 +364,7 @@
 
   Engine.prototype.drawSkeleton = function (ctx, hand, w, h) {
     if (!hand || !hand.landmarks || !hand.landmarks.length) return;
-    var L = hand.landmarks;
+    var LM = hand.landmarks;
     var CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
                 [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
                 [13,17],[17,18],[18,19],[19,20],[0,17]];
@@ -342,15 +373,15 @@
     ctx.lineWidth = 1.1;
     ctx.beginPath();
     for (var i = 0; i < CONN.length; i++) {
-      var a = L[CONN[i][0]], b = L[CONN[i][1]];
+      var a = LM[CONN[i][0]], b = LM[CONN[i][1]];
       ctx.moveTo(a.x * (w / this.W), a.y * (h / this.H));
       ctx.lineTo(b.x * (w / this.W), b.y * (h / this.H));
     }
     ctx.stroke();
     ctx.fillStyle = rgba(C.clay, 0.9);
-    for (var t = 0; t < L.length; t++) {
+    for (var t = 0; t < LM.length; t++) {
       ctx.beginPath();
-      ctx.arc(L[t].x * (w / this.W), L[t].y * (h / this.H), t % 4 === 0 ? 2.2 : 1.5, 0, TAU);
+      ctx.arc(LM[t].x * (w / this.W), LM[t].y * (h / this.H), t % 4 === 0 ? 2.2 : 1.5, 0, TAU);
       ctx.fill();
     }
   };
@@ -406,6 +437,15 @@
       var oe = clamp((o - (wh.lag || 0)) / (1 - (wh.lag || 0)), 0, 1);
       if (oe < 0.02) continue;
       for (var p = 0; p < count; p++) {
+        /* 瓣心柔光：让每片花瓣自己透亮，而非只有边缘亮 */
+        petalPoint(wh, count, p, 0.55, 0, o, sway, tmp);
+        var hs = wh.lenOpen * L.haloScale * oe * sc;
+        var hx = flower.x + tmp.x * sc * 0.72;
+        var hy = flower.y + tmp.y * sc * 0.72;
+        g.globalAlpha = L.haloAlpha * oe * alpha;
+        g.drawImage(this.pal[HALO_I], hx - hs / 2, hy - hs / 2, hs, hs);
+        g.globalAlpha = 1;
+
         g.beginPath();
         for (var i = 0; i <= SEG; i++) {
           petalPoint(wh, count, p, i / SEG, -1, o, sway, tmp);
@@ -439,11 +479,14 @@
     var tmp = this._tmp;
     var pal = this.pal;
 
-    /* --- 花心柔光晕 --- */
+    /* --- 花心双层柔光晕：外层暖晕铺开，内层白核提亮 --- */
     g.globalCompositeOperation = 'lighter';
-    g.globalAlpha = 0.20 * alpha * (0.42 + o * 0.58);
-    var gs = 74 * sc;
-    g.drawImage(pal[CORE_I], flower.x - gs / 2, flower.y - gs / 2, gs, gs);
+    var gs = L.coreGlowSize * sc * (0.62 + o * 0.38);
+    g.globalAlpha = L.coreGlowAlpha * alpha * (0.48 + o * 0.52);
+    g.drawImage(pal[HALO_I], flower.x - gs / 2, flower.y - gs / 2, gs, gs);
+    var gs2 = L.coreGlow2Size * sc * (0.70 + o * 0.30);
+    g.globalAlpha = L.coreGlow2Alpha * alpha * (0.50 + o * 0.50);
+    g.drawImage(pal[GLINT_I], flower.x - gs2 / 2, flower.y - gs2 / 2, gs2, gs2);
 
     /* --- 花瓣面 / 描边 --- */
     this.drawPetals(flower, now, alpha, isBud);
@@ -492,7 +535,8 @@
       var px = flower.x + pt.x * sc;
       var py = flower.y + pt.y * sc;
       var size = pt.size * sc * (pt.kind === 'core' ? (0.82 + o * 0.42) : (0.86 + o * 0.30));
-      var twinkle = 0.88 + 0.12 * Math.sin(now * 0.0016 + pt.phase);
+      var twinkle = (1 - L.twinkleDepth * 0.5) + L.twinkleDepth * 0.5 *
+                     Math.sin(now * L.twinkleSpeed + pt.phase);
       g.globalAlpha = pt.al * R.particleAlpha * alpha * twinkle;
       g.drawImage(pal[pt.ci], px - size, py - size, size * 2, size * 2);
     }
@@ -505,9 +549,9 @@
       for (var s = 0; s < flower.stamens.length; s++) {
         var st = flower.stamens[s];
         var a = st.a + sway + Math.sin(now * 0.0009 + st.ph) * 0.03;
-        var L = lerp(5, 30, o) * st.len * sc;
-        var ex = flower.x + Math.sin(a) * L;
-        var ey = flower.y - Math.cos(a) * L * F.flatten;
+        var stLen = lerp(5, 30, o) * st.len * sc;
+        var ex = flower.x + Math.sin(a) * stLen;
+        var ey = flower.y - Math.cos(a) * stLen * F.flatten;
         g.beginPath();
         g.moveTo(flower.x, flower.y);
         g.lineTo(ex, ey);
@@ -515,6 +559,59 @@
         g.globalAlpha = 0.55 * alpha * o;
         g.drawImage(pal[GLINT_I], ex - 1.8, ey - 1.8, 3.6, 3.6);
       }
+    }
+
+    /* --- 环境光粒与星芒：细碎亮点让整朵花透亮、有呼吸 --- */
+    this.drawMotes(flower, now, alpha, o);
+    this.drawGlints(flower, now, alpha, o);
+    g.globalAlpha = 1;
+  };
+
+  /* 环境光粒：绕花缓慢浮游，带各自轨道 / 明暗呼吸 / 色温 */
+  Engine.prototype.drawMotes = function (flower, now, alpha, o) {
+    var g = this.ctx, sc = flower.scale;
+    var motes = flower.motes;
+    if (!motes || !motes.length) return;
+    g.globalCompositeOperation = 'lighter';
+    var n = Math.round(motes.length * (0.55 + 0.45 * this.quality));
+    for (var i = 0; i < n; i++) {
+      var m = motes[i];
+      var a = m.a + now * L.moteDrift * m.drift;
+      var rr = m.r * (0.52 + o * 0.55) * sc;
+      var x = flower.x + Math.cos(a) * rr;
+      var y = flower.y + Math.sin(a) * rr * F.flatten
+              + Math.sin(now * L.moteBob * m.bob + m.ph) * 6 * sc;
+      var half = 0.5 + 0.5 * Math.sin(now * L.twinkleSpeed * 1.6 + m.ph);
+      var tw = 0.28 + 0.72 * half * half;
+      var sz = m.size * sc * (0.70 + 0.50 * tw);
+      g.globalAlpha = L.moteAlpha * alpha * tw * (0.45 + o * 0.55);
+      g.drawImage(this.pal[m.ci], x - sz, y - sz, sz * 2, sz * 2);
+    }
+    g.globalAlpha = 1;
+  };
+
+  /* 十字星芒：稀疏纯白，闪现一下即隐，是最细的一层高光 */
+  Engine.prototype.drawGlints = function (flower, now, alpha, o) {
+    var g = this.ctx, sc = flower.scale;
+    var gl = flower.glints;
+    if (!gl || !gl.length || o < 0.08) return;
+    g.globalCompositeOperation = 'lighter';
+    g.strokeStyle = '#FFFFFF';
+    g.lineWidth = 0.7;
+    for (var i = 0; i < gl.length; i++) {
+      var s = gl[i];
+      var t = Math.max(0, Math.sin(now * L.twinkleSpeed * 1.15 + s.ph));
+      var tw = t * t;
+      if (tw < 0.06) continue;
+      var x = flower.x + s.x * sc * (0.55 + o * 0.45);
+      var y = flower.y + s.y * sc * (0.55 + o * 0.45);
+      var len = L.glintLen * s.len * sc * tw;
+      g.globalAlpha = L.glintAlpha * alpha * tw * o;
+      g.beginPath();
+      g.moveTo(x - len, y); g.lineTo(x + len, y);
+      g.moveTo(x, y - len * 0.72); g.lineTo(x, y + len * 0.72);
+      g.stroke();
+      g.drawImage(this.pal[GLINT_I], x - 1.6, y - 1.6, 3.2, 3.2);
     }
     g.globalAlpha = 1;
   };
@@ -532,14 +629,14 @@
       s.x += s.vx; s.y += s.vy;
       var a = 1 - age / R.sparkLifeMs;
       /* 一道极细的流星拖影 */
-      g.globalAlpha = a * 0.20;
+      g.globalAlpha = a * 0.26;
       g.strokeStyle = rgba(C.spark, 1);
       g.lineWidth = 0.8;
       g.beginPath();
       g.moveTo(s.px, s.py);
       g.lineTo(s.x, s.y);
       g.stroke();
-      g.globalAlpha = a * 0.9;
+      g.globalAlpha = a * 1.0;
       g.drawImage(pal[s.color], s.x - s.size, s.y - s.size, s.size * 2, s.size * 2);
       keep.push(s);
     }
