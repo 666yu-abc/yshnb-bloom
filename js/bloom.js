@@ -498,6 +498,10 @@
       bp.shade *= 1 - 0.38 * Math.exp(-(bp.cx * bp.cx) / (20 * 20));
       /* 上亮下暗：光从上方来，蕾底沉在影里，才有立着的体积感 */
       bp.shade *= 0.62 + 0.38 * (1 - t9);
+      /* 轮廓光：靠近蕾体外缘的粒子提亮。加法混合下侧面花瓣本来很暗，
+       * 提一道边光，花蕾才会从黑底里「跳」出来，轮廓不再是光滑的椭圆。 */
+      var rimR = (RING_MAX + PETAL_HALF) * Math.max(prof, 0.001);
+      bp.shade *= 1 + 0.75 * smoothstep(0.72, 1.0, Math.abs(bp.cx) / rimR);
     }
 
     /* ---------- 排序：rank 降序，降质时少画尾部即可 ---------- */
@@ -636,7 +640,7 @@
     '  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);',
     '  float tw = 0.70 + 0.30 * sin(t * u_twinkle + ph * 6.2831);',
     '  float depth = 1.0 + 0.42 * (1.0 - clamp(length(a_open) / 420.0, 0.0, 1.0));',
-    '  float ps = a_size * u_scale * u_dpr * depth * tw * (1.0 + u_pulse * 0.55) * (1.06 - 0.06 * oe);',
+    '  float ps = a_size * u_scale * u_dpr * depth * tw * (1.0 + u_pulse * 0.55) * (1.34 - 0.34 * min(1.0, oe / 0.30));',
     '  gl_PointSize = clamp(ps, 1.0, u_maxSize);',
     '  float kindA = 1.0;',
     '  if (kind > 0.5 && kind < 1.5) { kindA = 1.35; }',
@@ -657,7 +661,7 @@
     '  if (shadeV < 0.001) { shadeV = 1.0; }',
     '  a *= mix(shadeV, 1.0, min(1.0, oe / 0.45));',
     /* 花苞是安静待放的，不该和全开一样白热 */
-    '  a *= 0.50 + 0.50 * min(1.0, oe / 0.5);',
+    '  a *= 0.40 + 0.60 * min(1.0, oe / 0.5);',
     /* 展开途中花是「缩小的」，中心密度是满开的三倍，会叠成一块死白。
      * 只在中间段把核心压一点，两端（花苞 / 全开）都不动。 */
     '  float midM = smoothstep(0.02, 0.30, oe) * (1.0 - smoothstep(0.62, 0.92, oe));',
