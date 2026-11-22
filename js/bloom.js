@@ -32,6 +32,10 @@
 
   /* ---------- 小工具 ---------- */
   function lerp(a, b, t) { return a + (b - a) * t; }
+  function smoothstep(a, b, x) {
+    var t = clamp((x - a) / Math.max(b - a, 0.0001), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
 
   function hexRgb(hex) {
@@ -114,13 +118,14 @@
 
   /* ============================================================
    * 位形烘焙：生成全部粒子的静态属性
-   * 数据布局（每粒子 12 个 float）：
+   * 数据布局（每粒子 13 个 float）：
    *   0,1  open  xy      2,3  close xy
    *   4,5,6 color rgb    7    size
    *   8    bright        9    phase
    *   10   lag           11   kind
+   *   12   shade     花苞态专用明暗（着色器按 oe 混回 1）
    * ============================================================ */
-  var STRIDE_F = 12;
+  var STRIDE_F = 13;
 
   function bake() {
     var rnd = mulberry(20261122);
@@ -383,75 +388,116 @@
       });
     }
 
-    /* ---------- 6) 花苞位形重映射：竖直纺锤光蕾 ----------
-     * 旧做法是让参数化花瓣「原地收拢」（外轮 lenClosed 46 / radiusClosed 20），
-     * 结果 12 万粒子被压进半径 20 的圆里，闭合成一个几十像素的白点，
-     * 完全看不出「这儿有一朵花在等着开」。
+    /* ---------- 6) 花苞位形：九片花瓣合拢成的光蕾 ----------
+     * 旧版把所有粒子按全开极角摊到一个椭圆盘上，结果就是「一堆粒子」：
+     * 没有瓣的边界、没有瓣缝、没有前后层次。
      *
-     * 现在按每个粒子【全开时的极角 a】和【归一化半径 rn】把它投到一枚
-     * 竖直纺锤形光蕾上：
-     *   · 高度 = rn → 同一根放射丝的所有点落在同一条竖线上，
-     *     闭合时是一条竖向光丝，蕾身有丝绒般的纵向纹理
-     *   · 横向 = sin 纺锤轮廓 × 9 瓣起伏 → 底圆、中饱、尖聚
-     *   · 螺旋 0.85 rad → 瓣缘有一道包卷走势，又不至于交叉成网
-     * 因为纺锤的角度集中在上方，着色器里不能直接用极坐标插值，
-     * 改用「角度先旋开、半径后生长」的分段插值（见 VS_PT）。
+     * 现在把每个粒子重新组织进「9 片竖直包拢的花瓣」：
+     *   · 瓣归属 k 由全开极角 a 决定（9 等分），瓣内相位 p ∈ [-1, 1]
+     *   · 沿瓣高度 t 由全开半径 r 决定 → 同一根放射丝变成一片花瓣里
+     *     从根到尖的一条纵向脉络，蕾身才有丝绒般的方向感，而不是噪点
+     *   · 每片花瓣是一条竖直纺锤叶：中段宽、两端收
+     *   · 9 瓣贴在一个立着的「蕾体」圆周上：正对镜头的瓣宽而亮，
+     *     侧过去的瓣窄而暗，正后方的被前面遮住 —— 体积感就来自这里
+     *   · 顶部横向收拢（pinch），瓣尖聚成一个收口；瓣尖再微微外翻
+     *   · 瓣内横向压暗成「瓣缝」，9 片花瓣才分得开（不做描边）
      */
-    /* 椭圆盘而不是纺锤：纺锤的极角集中在上下两端，做极坐标插值时角度要
-     * 从「上下」转到「四周」，跨 ±π 会把粒子撕成两半，中间留一道黑洞。
-     * 椭圆盘的角度天然均匀（就是全开时的极角），只让半径生长即可。 */
-    var BUD_CY = -16, BUD_W = 104, BUD_H = 158, BUD_CY_CORE = 4;
-    var budTmp = { x: 0, y: 0 };
-    function budShape(a, rn, out) {
-      var cs = Math.cos(a), sn = Math.sin(a);
-      var lobe = Math.pow(Math.abs(Math.cos(a * 4.5)), 0.55);
-      /* 顶端收四成、底端收一成半：蕾尖聚拢、蕾底圆润 */
-      var top = Math.max(0, -sn), bot = Math.max(0, sn);
-      var narrow = 1 - 0.40 * top * top - 0.16 * bot * bot;
-      out.x = cs * BUD_W * rn * (0.84 + 0.16 * lobe);
-      out.y = BUD_CY + sn * BUD_H * rn * narrow;
-      out.edge = Math.pow(Math.abs(cs), 0.85);   // 1 = 轮廓侧，0 = 正中
-      return out;
-    }
+    var SP = TAU / 9;
+    var BUD_Y_BASE = 80, BUD_Y_TIP = -150;
+    var BUD_H = BUD_Y_BASE - BUD_Y_TIP;
+    var RING_MAX = 57, PETAL_HALF = 24;
     for (i = 0; i < pts.length; i++) {
       var bp = pts[i];
       var kk = bp.kind;
+      bp.shade = 1;                              // 浮尘等环境层：花苞态不压暗
       if (kk === 3) continue;                    // 浮尘铺满全屏，不参与收拢
       var oa = Math.atan2(bp.oy / F.flatten, bp.ox);
       var orr0 = Math.sqrt(bp.ox * bp.ox + bp.oy * bp.oy);
+
       if (kk === 1) {
-        /* 花心始终守在蕾心：它就是花心，不该被摊到蕾身中段。
-         * 注意不能借 budShape —— 它的 taper 会把 rn=0.1 抬到半径 70 多，
-         * 插值到中间态就成了一圈环、正中一个黑洞。这里直接铺一个小椭圆。 */
+        /* 花心：藏在蕾里的一团暖光。叠加混合下它太亮会把蕾心烧成一个洞，
+         * 只留一点从瓣缝里透出来的暖调。 */
         var crad = Math.sqrt(rnd());
-        bp.cx = Math.cos(oa) * 34 * crad;
-        bp.cy = BUD_CY_CORE + Math.sin(oa) * 52 * crad;
+        bp.cx = Math.cos(oa) * 13 * crad;
+        bp.cy = 12 + Math.sin(oa) * 19 * crad;
+        bp.shade = 0.14;
         continue;
       }
       if (kk === 4) {
         /* 星芒：轻度收拢，仍在花蕾外围闪，保留空间感 */
-        bp.cx *= 0.40; bp.cy = bp.cy * 0.40 - 16;
-        bp.bright *= 0.72;
+        bp.cx *= 0.44; bp.cy = bp.cy * 0.44 - 20;
+        bp.shade = 0.60;
         continue;
       }
-      /* 花瓣 / 放射丝 / 金环：投到蕾身。
-       * 花瓣的全开半径最小也有 radiusOpen(66)，直接除以 R0 会整体落在 0.4
-       * 以外，蕾心只能靠花心那几千个点撑。这里按【花轮 lag】认出本层，
-       * 用 (r - 55)/(层半径 - 55) 归一化 —— 每层都从蕾心铺到蕾缘，蕾身才实心。
-       * 放射丝跨度太大（60~530），单开 0.62 次方压一压。 */
-      var rn;
-      if (kk === 0) {
-        var layerMax = bp.lag < 0.06 ? 318 : (bp.lag < 0.18 ? 235 : 152);
-        rn = clamp((orr0 - 55) / (layerMax - 55), 0, 1);
-      } else {
-        rn = Math.pow(clamp(orr0 / 530, 0, 1), 0.62);
-      }
-      budShape(oa, rn, budTmp);
-      bp.cx = budTmp.x;
-      bp.cy = budTmp.y;
-      /* 亮度层次不放这里：bright 是全局属性，烘焙时乘下去会连带改变
-       * 全开态（花瓣正面被压暗 16%，实心光瓣就散成了丝）。改由着色器
-       * 按 oe 混合 —— 见 VS_PT 里的 edgeC。 */
+
+      /* 瓣归属 + 瓣内相位 */
+      var k9 = Math.round(oa / SP);
+      var p9 = clamp((oa - k9 * SP) / (SP * 0.5), -1, 1);
+      /* 原分布是「瓣中密、瓣缘稀」的高斯，照搬会让瓣缘糊成雾、看不出
+       * 是一片花瓣。开 0.56 次方把粒子摊向两侧，瓣面才有宽度。 */
+      p9 = (p9 < 0 ? -1 : 1) * Math.pow(Math.abs(p9), 0.18);
+
+      /* 沿瓣长：外轮从蕾底铺到蕾尖，内层只到下段 —— 真实的「外瓣包内瓣」 */
+      /* 分层上限：外轮铺到蕾尖，中轮 0.80、内轮 0.60 —— 外层包住内层 */
+      var layerT = bp.lag < 0.06 ? 1.0 : (bp.lag < 0.18 ? 0.80 : 0.60);
+      var rawT = clamp((orr0 - 0.16 * R0) / (R0 - 0.16 * R0), 0, 1);
+      var t9 = Math.pow(rawT, 0.80) * layerT;
+      /* 底部抖动：瓣根 / 金环 / 内轮的 r 都很小，全挤在 t≈0，会在蕾底
+       * 叠出一圈死白的横环。把低 t 的粒子抖散到 0~0.22 的高度上。 */
+      t9 = Math.min(layerT, t9 + rnd() * 0.22 * (1 - Math.min(1, rawT * 2)));
+      /* 横向位置改为均匀重排：原来的 p 来自全开极角，而极角在瓣内是
+       * 「中间密、两边稀」的高斯 —— 照搬过来，每片瓣的中线就会叠成一条
+       * 死白的竖线，整朵蕾看着像几根发光条纹。均匀铺开才是「一片瓣」。 */
+      p9 = rnd() * 2 - 1;
+      /* 放射丝在花苞里若还沿纵向排，会把蕾画成一根根竖条。整片打散成云，
+       * 只负责填满瓣面；纵向的丝绒纹理交给 t 的明暗渐变。 */
+      if (kk === 2) { t9 = rnd() * layerT; }
+
+      /* 螺旋包卷：瓣中线随高度旋转，瓣缘在屏幕上变成斜弧线，
+       * 一片压住另一片的一角 —— 这才是「合拢的花」而不是「竖条列」。 */
+      var phi = k9 * SP + SP * 0.85 * t9;
+      var s9 = Math.sin(phi), c9 = Math.cos(phi);
+      /* 蕾体轮廓：下圆、中饱、上收 —— 一枚竖直的水滴形光蕾 */
+      var prof = Math.pow(Math.sin(Math.PI * (0.15 + 0.76 * t9)), 0.46);
+      /* 顶部收口：t→1 时横向急剧收拢，9 片瓣尖聚成一点 */
+      var pinch = 1 - 0.30 * t9 * t9 * t9;
+      /* 1 = 正对镜头，0 = 正后方 */
+      var face = 0.5 + 0.5 * c9;
+
+      var ringR = RING_MAX * prof * pinch;
+      /* 侧面的瓣被透视压窄，背面的最窄（本来也被前面遮住） */
+      var tipSharp = 1 - 0.22 * Math.pow(Math.max(0, (t9 - 0.70) / 0.30), 1.3);
+      var halfW = PETAL_HALF * prof * (0.42 + 0.58 * face) * tipSharp;
+      /* 瓣中亮、瓣缝暗（不描边，靠暗谷把 9 片瓣分开） */
+      var fold = Math.pow(Math.cos(Math.min(1, Math.abs(p9)) * 1.414), 1.1)
+                 * (1 + 0.60 * Math.pow(Math.abs(p9), 10));
+
+      bp.cx = ringR * s9 + p9 * halfW;
+      /* 背面瓣稍高、正面瓣稍低：从正面看有前后错落，不是一张平面 */
+      var tipJit = (((k9 * 7) % 5) - 2) * 5.0;
+      bp.cy = BUD_Y_BASE - BUD_H * t9 + c9 * 10 * prof + tipJit * t9 * prof;
+      /* 瓣尖拱起：瓣中最高、瓣缘低，每片瓣的顶缘才是一条弧 ——
+       * 有了这条弧，看到的才是「一片花瓣」，而不是一根竖条。 */
+      bp.cy -= 14.0 * (1 - p9 * p9) * t9 * t9 * t9;
+      /* 瓣尖外翻一点点，含苞待放的味道 */
+      bp.cx += (p9 < 0 ? -1 : 1) * 4.0 * t9 * t9 * t9 * t9;
+
+      /* 花苞态亮度层次：正面亮 / 侧面暗、瓣中亮 / 瓣缝暗、内层被包裹更暗。
+       * 编码进 a_shade，着色器按 oe 混回 1，绝不污染全开态。 */
+      bp.shade = (0.06 + 0.80 * Math.pow(face, 2.2)) * (0.40 + 0.60 * fold)
+               * (1 - 0.60 * clamp(bp.lag, 0, 1));
+      /* 瓣缘「受光的一道亮线 + 外侧迅速收黑」：加法混合没有遮挡，
+       * 相邻瓣重叠时只会叠亮、糊成一片。压黑瓣缘，重叠区就只剩上层，
+       * 视觉上才是「一片压住另一片」。 */
+      var ap = Math.abs(p9);
+      var edgeGlow = 1 + 0.85 * Math.exp(-Math.pow((ap - 0.82) / 0.09, 2));
+      var edgeCut = 1 - smoothstep(0.88, 1.0, ap);
+      bp.shade *= edgeGlow * edgeCut;
+      /* 正中一条纵缝：真实合拢的花苞正面是两片最外层花瓣的交界线，
+       * 是暗的。没有这条缝，正中间会叠成一条死白的亮线。 */
+      bp.shade *= 1 - 0.38 * Math.exp(-(bp.cx * bp.cx) / (20 * 20));
+      /* 上亮下暗：光从上方来，蕾底沉在影里，才有立着的体积感 */
+      bp.shade *= 0.62 + 0.38 * (1 - t9);
     }
 
     /* ---------- 排序：rank 降序，降质时少画尾部即可 ---------- */
@@ -469,6 +515,7 @@
       data[o + 9] = q.phase;
       data[o + 10] = q.lag;
       data[o + 11] = q.kind;
+      data[o + 12] = q.shade === undefined ? 1 : q.shade;
     }
     return { data: data, total: n };
   }
@@ -526,6 +573,7 @@
     'attribute float a_phase;',
     'attribute float a_lag;',
     'attribute float a_kind;',
+    'attribute float a_shade;',
     'uniform float u_time;',
     'uniform float u_open;',
     'uniform vec2 u_center;',
@@ -549,29 +597,22 @@
     '  float oe = clamp((u_open - lag) / max(1.0 - lag, 0.001), 0.0, 1.0);',
     '  oe = oe * oe * (3.0 - 2.0 * oe);',
     '  float kind = a_kind;',
-    /* 位形插值：不能所有粒子都直线 mix —— 花苞是竖直的、全开是摊平的，
-     * 直线插值会让中间态「趴」成一团横向火苗。花瓣/放射丝改走极坐标：
-     * 角度基本不变、只让半径生长，花就像从蕾里一层层翻出来。 */
+    /* 位形插值分两段。
+     * 花苞是「竖直圆柱上的 9 片瓣」，全开是「摊平的辐射盘」，两者尺寸也差
+     * 三倍 —— 一路直线 mix 到全开，中间态会散成一朵「烟花」：一边摊平、
+     * 一边半径暴涨。所以先在 0→0.42 把花苞展开成一朵缩小版的全开花
+     * （半径 0.4），再 0.42→1 纯缩放长大。后半段是等比缩放，绝对平滑。 */
     '  vec2 local;',
-    '  if (kind > 0.5 && kind < 1.5) {',
-    /* 花心先归位：它本来就该一直在中心。若和花瓣同步插值，中途会被摊到
-     * 一圈环上，画面正中反而出现一个椭圆黑洞。 */
-    '    local = mix(a_close, a_open, min(1.0, oe * 1.7));',
-    '  } else if (kind > 2.5) {',
-    '    local = mix(a_close, a_open, oe);',   // 浮尘 / 星芒：环境层，直线最稳
+    '  if (kind > 2.5) {',
+    '    local = mix(a_close, a_open, oe);',        // 浮尘 / 星芒：环境层
+    '  } else if (kind > 0.5 && kind < 1.5) {',
+    /* 花心提前归位：它本来就一直在中心，同步插值会中途被摊成一圈环 */
+    '    local = mix(a_close, a_open, min(1.0, oe * 1.5));',
     '  } else {',
-    '    float rC = length(a_close);',
-    '    float rO = length(a_open);',
-    '    float aC = atan(a_close.y, a_close.x);',
-    '    float aO = atan(a_open.y, a_open.x);',
-    '    float da = aO - aC;',
-    '    da = mod(da + 3.14159265, 6.2831853) - 3.14159265;',
-    /* 角度先旋开、半径后生长：纺锤花蕾的角度集中在上方，若两者同步插值，
-     * 半开时花瓣还全挤在上半圈，整朵花是「趴」着的。先把角度转到全开的
-     * 分布（oe*1.7 提前转完），半径再跟上，过程才像花瓣一层层翻开。 */
-    '    float rr = mix(rC, rO, pow(oe, 1.55));',
-    '    float av = aC + da * min(1.0, oe * 1.7);',
-    '    local = vec2(cos(av), sin(av)) * rr;',
+    '    vec2 mid = a_open * 0.78;',
+    '    float k1 = 0.32;',
+    '    if (oe < k1) { local = mix(a_close, mid, pow(oe / k1, 1.45)); }',
+    '    else { local = mix(mid, a_open, (oe - k1) / (1.0 - k1)); }',
     '  }',
     '  float ph = a_phase + u_seed;',
     '  float t = u_time;',
@@ -595,7 +636,7 @@
     '  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);',
     '  float tw = 0.70 + 0.30 * sin(t * u_twinkle + ph * 6.2831);',
     '  float depth = 1.0 + 0.42 * (1.0 - clamp(length(a_open) / 420.0, 0.0, 1.0));',
-    '  float ps = a_size * u_scale * u_dpr * depth * tw * (1.0 + u_pulse * 0.55) * (0.86 + 0.14 * oe);',
+    '  float ps = a_size * u_scale * u_dpr * depth * tw * (1.0 + u_pulse * 0.55) * (1.06 - 0.06 * oe);',
     '  gl_PointSize = clamp(ps, 1.0, u_maxSize);',
     '  float kindA = 1.0;',
     '  if (kind > 0.5 && kind < 1.5) { kindA = 1.35; }',
@@ -604,26 +645,28 @@
     '  else if (kind > 3.5) { kindA = 0.90; }',
     '  float a = a_bright * kindA * u_bright * u_alpha * (0.55 + 0.45 * tw);',
     '  if (kind > 3.5) { a *= tw * tw * tw; }',
-    /* 花苞态让放射丝退到幕后：900 条丝在闭合时是 900 根「针」，把蕾身
-     * 扎成一束针叶。这里按 oe 把它们压暗并内收，蕾身交回高密度的花瓣本体，
-     * 丝只留下一点丝绒纹理；绽放后再恢复成主角。 */
+    /* 放射丝在花苞态是「针」：压暗到幕后，蕾身交回花瓣本体，
+     * 丝只留一点丝绒纹理；绽放后再恢复成主角。 */
     '  if (kind > 1.5 && kind < 2.5) {',
-    '    a *= 0.48 + 0.52 * oe;',
+    '    a *= 0.20 + 0.80 * min(1.0, oe / 0.5);',
     '  }',
-    /* 收拢时略压暗：花苞是一枚安静的光蕾，绽放才该亮起来。
-     * 但压太狠会让闭合态显得死气沉沉 —— 0.76 起步，只做轻微收敛。 */
-    /* 花苞是安静待放的，不该和全开一样白热：0.74 起步，
-     * 蕾身才透得出那 9 瓣收拢的结构。 */
-    '  a *= 0.74 + 0.26 * oe;',
-    /* 花苞的明暗层次：蕾身轮廓侧受光更亮、正面背光稍暗。必须按 oe 混回 1，
-     * 否则会把全开的实心瓣面一起压暗。 */
-    '  float edgeC = 0.0;',
-    '  if (length(a_close) > 0.001) { edgeC = abs(normalize(a_close).x); }',
-    '  a *= mix(0.84 + 0.44 * edgeC, 1.0, oe);',
-    '  if (kind > 0.5 && kind < 1.5) { a *= mix(1.15, 1.0, oe); }',
-    /* 收拢时向白色提亮一点：花瓣在花苞里是「背光透光」的，
-     * 仍是深玫红会显得发黑，混 20% 白才有蕾内透光的感觉。 */
-    '  v_color = mix(a_color, vec3(1.0), 0.20 * (1.0 - oe));',
+    /* 花苞的明暗层次全在烘焙里算好了（a_shade：正面亮 / 侧面暗、
+     * 瓣中亮 / 瓣缝暗、内层被包裹更暗）。这里按 oe 混回 1，绝不污染全开态。
+     * 兜底：万一属性没绑定上（默认 0），退回 1，避免整朵蕾黑掉。 */
+    '  float shadeV = a_shade;',
+    '  if (shadeV < 0.001) { shadeV = 1.0; }',
+    '  a *= mix(shadeV, 1.0, min(1.0, oe / 0.45));',
+    /* 花苞是安静待放的，不该和全开一样白热 */
+    '  a *= 0.50 + 0.50 * min(1.0, oe / 0.5);',
+    /* 展开途中花是「缩小的」，中心密度是满开的三倍，会叠成一块死白。
+     * 只在中间段把核心压一点，两端（花苞 / 全开）都不动。 */
+    '  float midM = smoothstep(0.02, 0.30, oe) * (1.0 - smoothstep(0.62, 0.92, oe));',
+    '  float coreM = 1.0 - smoothstep(0.04, 0.40, length(local) / 220.0);',
+    '  a *= (1.0 - 0.28 * midM) * (1.0 - 0.46 * midM * coreM);',
+    '  if (kind > 0.5 && kind < 1.5) { a *= 0.12 + 0.88 * smoothstep(0.50, 0.95, oe); }',
+    /* 收拢时向白色提亮一点点：花瓣在蕾里是「背光透光」的，深玫红会发黑。
+     * 新几何已有清晰结构，混多了会发白，只留 8%。 */
+    '  v_color = mix(a_color, vec3(1.0), 0.08 * (1.0 - oe));',
     '  v_alpha = a;',
     '  v_kind = kind;',
     '}'
@@ -964,7 +1007,7 @@
     var layout = [
       ['a_open', 2, 0], ['a_close', 2, 2], ['a_color', 3, 4],
       ['a_size', 1, 7], ['a_bright', 1, 8], ['a_phase', 1, 9],
-      ['a_lag', 1, 10], ['a_kind', 1, 11]
+      ['a_lag', 1, 10], ['a_kind', 1, 11], ['a_shade', 1, 12]
     ];
     for (var li = 0; li < layout.length; li++) {
       var loc = this._a('pt', layout[li][0]);
