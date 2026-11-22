@@ -193,7 +193,23 @@
       delegate: 'GPU',
       bundleUrl: abs('./vendor/vision_bundle.mjs'),
       wasmPath: abs('./vendor/wasm'),
-      modelPath: abs('./vendor/hand_landmarker.task')
+      modelPath: abs('./vendor/hand_landmarker.task'),
+      /* 预下载：优先取 gzip 版本（wasm 14.6→4.0 MB，模型 7.8→5.5 MB），
+       * 浏览器不支持流式解压或 gz 缺失时自动回退原始文件。
+       * 下载完成后改用内存 blob URL + modelAssetBuffer 初始化，
+       * 让 createFromOptions 阶段完全不碰网络，超时只用于本地 wasm 编译。 */
+      wasmGzPath: abs('./vendor/wasm/vision_wasm_internal.wasm.gz'),
+      modelGzPath: abs('./vendor/hand_landmarker.task.gz'),
+      wasmLoaderPath: abs('./vendor/wasm/vision_wasm_internal.js'),
+      wasmBinaryPath: abs('./vendor/wasm/vision_wasm_internal.wasm'),
+      downloadTimeoutMs: 180000,  // 单次资源下载硬超时（慢网留足）
+      initTimeoutMs: 90000,       // wasm 编译 + 图初始化（纯本地，正常几秒）
+      progressThrottleMs: 140,    // 进度状态刷新节流
+      /* 仅供进度显示预估：两个 gzip 资源的体积（字节），让百分比从
+       * 第一帧就合理。与实际文件略有出入不影响加载；回退原始大文件时
+       * 会自动以响应头 content-length 为准。 */
+      wasmGzBytes: 4143229,
+      modelGzBytes: 5813816
     }
   };
 

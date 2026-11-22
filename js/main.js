@@ -5,7 +5,6 @@
   'use strict';
 
   var Y = global.YSHNB;
-  var V = Y.CFG.vision;
 
   var el = {};
   var engine, gestures;
@@ -222,7 +221,7 @@
     Y.Hand.init({
       onStatus: function (kind, detail) {
         var map = {
-          model: '正在加载手势模型…（首次约 22 MB，请稍候）',
+          model: '正在加载手势模型…（约 10 MB，请稍候）',
           ready: '摄像头已就绪 · 握拳收拢，张手绽放',
           denied: '摄像头权限被拒绝',
           nocamera: '没有找到摄像头',
@@ -242,7 +241,7 @@
           var why = String(detail || '').replace(/^手势模型加载失败：/, '');
           showNotice(
             '手势识别模型没有加载成功' + (why ? '：' + why : '') +
-            '。首次需下载约 22 MB 模型，可点「重试」再试一次；视频只在本机运算，也可以先用鼠标完整体验。',
+            '。模型约 10 MB，已下载的部分会保留，点「重试」无需重新下载；视频只在本机运算，也可以先用鼠标完整体验。',
             '用鼠标继续',
             function () { Y.Hand.usePointer(W, H); },
             '重试摄像头',
@@ -271,17 +270,10 @@
     bind();
     resize();
 
-    /* 停留在开始页时后台预热三大件（bundle / 模型 / wasm），
-     * 用户读说明的这几秒里就把约 22 MB 拉进 HTTP 缓存，
-     * 进入体验页时 HandLandmarker 能直接命中，不必干等。 */
-    if (global.fetch) {
-      [V.modelPath,
-       V.wasmPath + '/vision_wasm_internal.js',
-       V.wasmPath + '/vision_wasm_internal.wasm',
-       V.bundleUrl].forEach(function (u) {
-        fetch(u).then(function (r) { return r.arrayBuffer(); }).catch(function () {});
-      });
-    }
+    /* 停留在开始页时后台预热：与进入体验页共用同一个单例 Promise，
+     * 下载走 gzip 并上报真实字节进度；稍作延后，避免和首屏渲染抢带宽。
+     * 预热失败也不影响鼠标模式，重试时已下载的资源不会重复拉取。 */
+    setTimeout(function () { Y.Hand.preload(); }, 900);
   }
 
   if (document.readyState === 'loading') {

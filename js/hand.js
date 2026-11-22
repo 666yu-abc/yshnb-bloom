@@ -228,59 +228,253 @@
   function log() {
     if (global.console && console.info) console.info.apply(console, arguments);
   }
+  function warn() {
+    if (global.console && console.warn) console.warn.apply(console, arguments);
+  }
+
+  /* 超时会标记 __timeout：超时的实例底层仍在运行，绝不能「再建一个」
+   * 取代它，否则两个 createFromOptions 会争夺全局 ModuleFactory 而双双挂起。 */
   function withTimeout(promise, ms, label) {
     return new Promise(function (resolve, reject) {
       var done = false;
       var timer = setTimeout(function () {
-        if (!done) reject(new Error(label + ' 超时（>' + Math.round(ms / 1000) + 's）'));
+        if (done) return;
+        done = true;
+        var e = new Error(label + ' 超时（>' + Math.round(ms / 1000) + 's）');
+        e.__timeout = true;
+        reject(e);
       }, ms);
-      promise.then(function (v) { done = true; clearTimeout(timer); resolve(v); },
-                   function (e) { done = true; clearTimeout(timer); reject(e); });
+      promise.then(function (v) {
+        if (done) return;
+        done = true; clearTimeout(timer); resolve(v);
+      }, function (e) {
+        if (done) return;
+        done = true; clearTimeout(timer); reject(e);
+      });
     });
   }
 
-  function loadLandmarker() {
-    /* 动态 import 本地 ESM bundle；不依赖任何外部 CDN。
-     * 每一步单独包超时并打日志，任何一环失败都能在控制台看到确切原因，
-     * 错误信息也会回传到界面提示，而不是笼统的「网络或路径问题」。 */
-    return withTimeout(import(V.bundleUrl), 20000, 'ESM 模块').then(function (mod) {
+  /* ---------- 资源预下载：整站只下载一次，带真实字节进度 ----------
+   * 旧实现把未压缩的模型与 wasm 下载压在 createFromOptions 的 45s 超时里，慢网必炸；
+   * 且开始页并发预热 4 个文件，与初始化重复下载、互抢带宽。
+   * 现在由单例 Promise 统管：优先 gzip 流式解压（约 10 MB），结果以
+   * ArrayBuffer 缓存；初始化改用 blob URL + modelAssetBuffer，零网络请求，
+   * 超时只用于本地 wasm 编译。失败也保留已下载资源，重试不再重复拉取。 */
+  var boot = {
+    promise: null,      // 整个加载的单例（首次 / 预热 / 重试共用，绝不并发）
+    assets: null        // 已下载资源缓存
+  };
+
+  function canGunzip() {
+    try {
+      return typeof global.DecompressionStream === 'function' &&
+             typeof global.Response === 'function' &&
+             typeof global.Blob === 'function';
+    } catch (e) { return false; }
+  }
+
+  /* AbortController 超时会真正中止请求，不像旧 withTimeout 只拒绝外层
+   * Promise、把底层 fetch 留在后台继续占带宽。 */
+  function fetchBuffer(url, timeoutMs, onBytes) {
+    var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, timeoutMs) : null;
+    var opts = { credentials: 'same-origin' };
+    if (ctrl) opts.signal = ctrl.signal;
+    return fetch(url, opts).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' · ' + url.split('/').pop());
+      var total = Number(r.headers && r.headers.get('content-length')) || 0;
+      if (!r.body || !r.body.getReader) {
+        return r.arrayBuffer().then(function (b) {
+          if (onBytes) onBytes(b.byteLength, total || b.byteLength);
+          return b;
+        });
+      }
+      var reader = r.body.getReader();
+      var chunks = [], received = 0;
+      return new Promise(function (resolve, reject) {
+        function pump() {
+          reader.read().then(function (step) {
+            if (step.done) {
+              var out = new Uint8Array(received), off = 0;
+              for (var i = 0; i < chunks.length; i++) {
+                out.set(chunks[i], off); off += chunks[i].length;
+              }
+              resolve(out.buffer);
+              return;
+            }
+            chunks.push(step.value);
+            received += step.value.length;
+            if (onBytes) onBytes(received, total);
+            pump();
+          }, reject);
+        }
+        pump();
+      });
+    }).then(function (buf) {
+      if (timer) clearTimeout(timer);
+      return buf;
+    }, function (e) {
+      if (timer) clearTimeout(timer);
+      if (e && e.name === 'AbortError') e = new Error('下载超时：' + url.split('/').pop());
+      throw e;
+    });
+  }
+
+  function gunzip(buf) {
+    var ds = new global.DecompressionStream('gzip');
+    var stream = new Blob([buf]).stream().pipeThrough(ds);
+    return new global.Response(stream).arrayBuffer();
+  }
+
+  /* 单个资源：gzip 优先，任何环节失败都回退原始文件。
+   * magic 是目标文件头（wasm = 00 61 73 6d，task = 50 4b 'PK'），
+   * 用于识别「CDN 已自动解压」的情况：此时 body 已是原文，不能再 gunzip。 */
+  function fetchAsset(gzUrl, rawUrl, timeoutMs, onBytes, label, magic) {
+    if (canGunzip() && gzUrl) {
+      return fetchBuffer(gzUrl, timeoutMs, onBytes).then(function (buf) {
+        var h = new Uint8Array(buf, 0, Math.min(16, buf.byteLength));
+        var isGz = h[0] === 0x1f && h[1] === 0x8b;
+        /* .task 文件在 PK 头前可能带前缀，故在文件头内搜索签名而非硬比前 4 字节 */
+        var isRaw = false;
+        if (magic) {
+          for (var i = 0; i + magic.length <= h.length; i++) {
+            var hit = true;
+            for (var j = 0; j < magic.length; j++) {
+              if (h[i + j] !== magic[j]) { hit = false; break; }
+            }
+            if (hit) { isRaw = true; break; }
+          }
+        }
+        if (isRaw) { log(TAG, label + ' 响应已被自动解压，跳过 gunzip'); return buf; }
+        if (isGz) return gunzip(buf);
+        throw new Error('响应既非 gzip 也非目标文件');
+      }).catch(function (e) {
+        warn(TAG, label + ' gzip 路径不可用，回退原始文件：', e && e.message);
+        return fetchBuffer(rawUrl, timeoutMs, onBytes);
+      });
+    }
+    return fetchBuffer(rawUrl, timeoutMs, onBytes);
+  }
+
+  function prepareAssets() {
+    if (boot.assets) return Promise.resolve(boot.assets);
+    var prog = [{ r: 0, t: 0 }, { r: 0, t: 0 }];
+    var lastEmit = 0;
+    function emitAll(force) {
+      var now = Date.now();
+      if (!force && now - lastEmit < V.progressThrottleMs) return;
+      lastEmit = now;
+      var loaded = prog[0].r + prog[1].r;
+      /* 分母取「响应头长度 / 已收字节 / 预估体积」三者最大值：
+       * 两个资源不会同时回报长度，用预估值兜底可避免首帧百分比虚高。 */
+      var totalB = Math.max(prog[0].t, prog[0].r, V.wasmGzBytes || 1) +
+                   Math.max(prog[1].t, prog[1].r, V.modelGzBytes || 1);
+      var pct = force ? 100 : Math.min(99, Math.round(loaded / totalB * 100));
+      status('download', '正在加载手势模型 ' +
+        (loaded / 1048576).toFixed(1) + ' / ' + (totalB / 1048576).toFixed(1) +
+        ' MB · ' + pct + '%');
+    }
+    function emit(i) {
+      return function (received, total) {
+        prog[i].r = received;
+        if (total) prog[i].t = total;
+        emitAll(false);
+      };
+    }
+    return Promise.all([
+      fetchAsset(V.wasmGzPath, V.wasmBinaryPath, V.downloadTimeoutMs, emit(0), 'wasm',
+                 [0x00, 0x61, 0x73, 0x6d]),
+      fetchAsset(V.modelGzPath, V.modelPath, V.downloadTimeoutMs, emit(1), 'model',
+                 [0x50, 0x4b, 0x03, 0x04])
+    ]).then(function (arr) {
+      var wasmBuf = arr[0], modelBuf = arr[1];
+      /* blob URL 让 glue 的 locateFile 命中内存，初始化阶段不再发网络请求 */
+      var wasmUrl = V.wasmBinaryPath;
+      try {
+        wasmUrl = URL.createObjectURL(new Blob([wasmBuf], { type: 'application/wasm' }));
+      } catch (e) { warn(TAG, 'blob URL 不可用，回退文件 URL'); }
+      boot.assets = {
+        fileset: { wasmLoaderPath: V.wasmLoaderPath, wasmBinaryPath: wasmUrl },
+        modelBuffer: new Uint8Array(modelBuf)
+      };
+      emitAll(true);   // 补一次 100% 终态，避免节流把最后一帧吞掉
+      status('download', '资源就绪，正在初始化…');
+      log(TAG, '资源已缓存：wasm ' + wasmBuf.byteLength + ' B, model ' + modelBuf.byteLength + ' B');
+      return boot.assets;
+    });
+  }
+
+  function makeOptions(delegate, assets) {
+    return {
+      baseOptions: { modelAssetBuffer: assets.modelBuffer, delegate: delegate },
+      runningMode: 'VIDEO',
+      numHands: V.numHands,
+      minHandDetectionConfidence: V.minHandDetectionConfidence,
+      minHandPresenceConfidence: V.minHandPresenceConfidence,
+      minTrackingConfidence: V.minTrackingConfidence
+    };
+  }
+
+  function buildFast(mod, delegate, assets) {
+    return withTimeout(
+      mod.HandLandmarker.createFromOptions(assets.fileset, makeOptions(delegate, assets)),
+      V.initTimeoutMs, '模型初始化(' + delegate + ')'
+    );
+  }
+
+  /* 兜底：退回 FilesetResolver + 原始 wasm URL，万一某浏览器不接受
+   * blob URL 仍能救回来；模型仍用已缓存的 buffer，避免再下载一次。 */
+  function buildLegacy(mod, assets) {
+    return mod.FilesetResolver.forVisionTasks(V.wasmPath).then(function (fileset) {
+      return withTimeout(mod.HandLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetBuffer: assets.modelBuffer, delegate: 'CPU' },
+        runningMode: 'VIDEO',
+        numHands: V.numHands,
+        minHandDetectionConfidence: V.minHandDetectionConfidence,
+        minHandPresenceConfidence: V.minHandPresenceConfidence,
+        minTrackingConfidence: V.minTrackingConfidence
+      }), V.initTimeoutMs, '标准初始化(CPU)');
+    });
+  }
+
+  function initLandmarker(mod, assets) {
+    /* 严格串行：只有「明确报错」才换后端重来；超时说明底层实例还在跑，
+     * 此时另起一个 createFromOptions 会与它争全局 ModuleFactory，必挂。 */
+    return buildFast(mod, V.delegate, assets).catch(function (e) {
+      if (e && e.__timeout) throw e;
+      warn(TAG, V.delegate + ' 后端不可用，改用 CPU：', e && e.message);
+      return buildFast(mod, 'CPU', assets);
+    }).catch(function (e) {
+      if (e && e.__timeout) throw e;
+      warn(TAG, '内存资源初始化失败，回退标准加载：', e && e.message);
+      return buildLegacy(mod, assets);
+    });
+  }
+
+  function doLoad() {
+    return withTimeout(import(V.bundleUrl), 30000, 'ESM 模块').then(function (mod) {
       if (!mod || !mod.FilesetResolver || !mod.HandLandmarker) {
         throw new Error('ESM 模块导出异常（FilesetResolver / HandLandmarker 缺失）');
       }
       log(TAG, 'bundle 已加载');
-      return withTimeout(
-        mod.FilesetResolver.forVisionTasks(V.wasmPath), 20000, 'wasm 路径解析'
-      ).then(function (fileset) {
-        function build(delegate) {
-          return withTimeout(
-            mod.HandLandmarker.createFromOptions(fileset, {
-              baseOptions: { modelAssetPath: V.modelPath, delegate: delegate },
-              runningMode: 'VIDEO',
-              numHands: V.numHands,
-              minHandDetectionConfidence: V.minHandDetectionConfidence,
-              minHandPresenceConfidence: V.minHandPresenceConfidence,
-              minTrackingConfidence: V.minTrackingConfidence
-            }), 45000, '模型初始化(' + delegate + ')'
-          );
-        }
-        /* 有些设备没有可用的 WebGL 后端，GPU 建不起来时自动退回 CPU 推理 */
-        return build(V.delegate).catch(function (gpuErr) {
-          if (global.console && console.warn) {
-            console.warn(TAG, 'GPU 后端不可用，改用 CPU：', gpuErr && gpuErr.message);
-          }
-          return build('CPU');
-        });
-      }).then(function (lm) {
-        log(TAG, 'HandLandmarker 就绪');
-        return lm;
-      });
-    }).catch(function (err) {
+      return prepareAssets()
+        .then(function (assets) { return initLandmarker(mod, assets); })
+        .then(function (lm) { log(TAG, 'HandLandmarker 就绪'); return lm; });
+    });
+  }
+
+  /* 单例：首次、开始页预热、失败重试全部复用同一个 Promise。
+   * 只有彻底失败才清空，但 boot.assets 保留 → 重试不再下载约 10 MB。 */
+  function loadLandmarker() {
+    if (boot.promise) return boot.promise;
+    boot.promise = doLoad().catch(function (err) {
       if (global.console && console.error) {
         console.error(TAG, '加载失败：', (err && err.message) || err, err);
-        console.error(TAG, '资源路径：', V.bundleUrl, V.wasmPath, V.modelPath);
       }
+      boot.promise = null;
       throw err;
     });
+    return boot.promise;
   }
 
   function stopCamera() {
@@ -374,6 +568,9 @@
 
   Y.Hand = {
     init: function (opts) { state.onStatus = opts.onStatus || function () {}; },
+    /* 开始页后台预热：与 startCamera 共用同一个单例 Promise，
+     * 用户读说明的几秒里就把资源拉进内存，进入体验页时直接命中。 */
+    preload: function () { return loadLandmarker().catch(function () {}); },
     startCamera: startCamera,
     stopCamera: stopCamera,
     usePointer: usePointer,
